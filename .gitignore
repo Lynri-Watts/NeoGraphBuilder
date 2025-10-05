@@ -1,0 +1,62 @@
+# Python byte-compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Deprecated directories and files
+_deprecated/
+
+# Models directory
+models/
+
+# Virtual environments
+venv/
+env/
+ENV/
+*.venv
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory
+htmlcov/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Database files
+*.sqlite
+*.db
+
+# Package files
+*.egg-info/
+build/
+dist/
+*.egg
+
+# Yuanbao API (if needed)
+yuanbao API/
