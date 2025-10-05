@@ -38,25 +38,27 @@ NEO4J_CONFIG = {
     "password": "12345678"
 }
 
-# 系统提示词 - 要求输出concepts和relations结构化数据
+# 系统提示词 - 要求输出nodes和relations结构化数据
 system_prompt = """
-你现在的任务是从文本中提取知识图谱所需的结构化信息，包括概念(concepts)和关系(relations)。
+你现在的任务是从文本中提取知识图谱所需的结构化信息，包括节点(nodes)和关系(relations)。
 
 请严格按照以下JSON格式输出，不要包含任何其他内容：
 {
-  "concepts": [
+  "nodes": [
     {
-      "name": "概念名称",
-      "description": "概念的详细描述",
+      "name": "节点名称",
+      "type": "Concept",  // 或 "Entity"
+      "description": "节点的详细描述",
       "context": ["相关上下文词汇1", "相关上下文词汇2"],
-      "source_document": "来源文档标识"
+      "source_document": "来源文档标识",
+      "aliases": ["别称1", "缩写1", "别称2"]
     }
-    // 更多概念...
+    // 更多节点...
   ],
   "relations": [
     {
-      "source": "源概念名称",
-      "target": "目标概念名称",
+      "source": "源节点名称",
+      "target": "目标节点名称",
       "type": "关系类型",
       "weight": 1.0,
       "properties": {
@@ -68,12 +70,16 @@ system_prompt = """
 }
 
 提取要求：
-1. 概念(concepts)列表应包含文本中所有重要实体、概念和主题
-2. 每个概念需提供name(名称)和description(描述)，context(上下文)和source_document(来源)为可选
-3. 关系(relations)列表应包含概念之间的所有有意义的连接
-4. 关系必须包含source(源)、target(目标)和type(类型)，weight(权重)默认为1.0，properties(属性)为可选
-5. 请确保输出的JSON格式完全正确，可被程序直接解析
-6. 使用与输入文本相同的语言进行输出
+1. 节点(nodes)列表应包含文本中所有重要的概念和实体
+2. 对于每个节点，请正确设置type字段：
+   - "Concept"：表示抽象的概念、理论、思想、学科等非实体事物
+   - "Entity"：表示现实中存在的具体事物、人物、组织、地点等
+3. 每个节点需提供name(名称)、type(类型)和description(描述)，context(上下文)和source_document(来源)为可选
+4. 每个节点必须包含aliases字段，列出该节点的所有可能别称和缩写形式，即使文章中未直接提及
+5. 无论输入为何种语言，请优先使用中文全称作为name字段的第一标识符
+6. 关系(relations)列表应包含节点之间的所有有意义的连接
+7. 关系必须包含source(源)、target(目标)和type(类型)，weight(权重)默认为1.0，properties(属性)为可选
+8. 请确保输出的JSON格式完全正确，可被程序直接解析
 """
 
 def load_input_file(file_path):
@@ -210,7 +216,7 @@ def process_knowledge_graph(data, source_document="unknown"):
     处理知识图谱数据并插入数据库
     
     Args:
-        data: 包含concepts和relations的字典
+        data: 包含nodes和relations的字典
         source_document: 来源文档标识
         
     Returns:
@@ -226,19 +232,22 @@ def process_knowledge_graph(data, source_document="unknown"):
             NEO4J_CONFIG["password"]
         )
         
-        # 处理概念
-        concepts = data.get('concepts', [])
-        # 为每个概念添加source_document信息（如果未提供）
-        for concept in concepts:
-            if 'source_document' not in concept:
-                concept['source_document'] = source_document
+        # 处理节点
+        nodes = data.get('nodes', [])
+        # 为每个节点添加source_document信息（如果未提供）
+        for node in nodes:
+            if 'source_document' not in node:
+                node['source_document'] = source_document
             # 确保context字段存在
-            if 'context' not in concept:
-                concept['context'] = []
+            if 'context' not in node:
+                node['context'] = []
+            # 确保type字段存在，默认为Concept
+            if 'type' not in node:
+                node['type'] = 'Concept'
         
-        logger.info(f"开始插入 {len(concepts)} 个概念到数据库...")
-        concept_count = kg.insert_concepts(concepts)
-        logger.info(f"成功插入 {concept_count} 个概念")
+        logger.info(f"开始插入 {len(nodes)} 个节点到数据库...")
+        node_count = kg.insert_nodes(nodes)
+        logger.info(f"成功插入 {node_count} 个节点")
         
         # 处理关系
         relations = data.get('relations', [])
@@ -247,7 +256,7 @@ def process_knowledge_graph(data, source_document="unknown"):
         logger.info(f"成功插入 {relation_count} 个关系")
         
         return {
-            "concepts_processed": concept_count,
+            "nodes_processed": node_count,
             "relations_processed": relation_count,
             "source_document": source_document
         }
@@ -289,7 +298,7 @@ def main(input_file=None, text=None):
         # 打印最终结果
         logger.info("=== 知识图谱构建完成 ===")
         logger.info(f"来源文档: {result['source_document']}")
-        logger.info(f"处理概念数: {result['concepts_processed']}")
+        logger.info(f"处理节点数: {result['nodes_processed']}")
         logger.info(f"处理关系数: {result['relations_processed']}")
         
         return result

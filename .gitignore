@@ -6,6 +6,9 @@ __pycache__/
 # Deprecated directories and files
 _deprecated/
 
+# Documents directory
+documents/
+
 # Models directory
 models/
 

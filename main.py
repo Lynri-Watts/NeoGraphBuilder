@@ -112,14 +112,47 @@ def process_pdf_to_knowledge_graph(pdf_path: str, chunk_size: int = CHUNK_SIZE, 
         logger.info(f"开始处理PDF文件: {pdf_path}")
         text = read_pdf(pdf_path)
         
-        # 分割文本为块
-        chunks = split_text_with_overlap(text, chunk_size, overlap_size)
-        
         # 汇总统计
         total_concepts = 0
         total_relations = 0
         processed_chunks = 0
         failed_chunks = 0
+        
+        # 第一步：对整篇文章进行完整提取
+        logger.info("=== 第一步：对整篇文章进行完整提取 ===")
+        source_document = f"{os.path.basename(pdf_path)}_full_document"
+        
+        retry_count = 0
+        success = False
+        full_document_result = None
+        
+        while retry_count < MAX_RETRIES and not success:
+            try:
+                # 调用workflow处理整篇文章
+                full_document_result = workflow_main(text=text)
+                
+                if full_document_result:
+                    # 更新统计
+                    total_concepts += full_document_result.get('concepts_processed', 0)
+                    total_relations += full_document_result.get('relations_processed', 0)
+                    processed_chunks += 1
+                    success = True
+                    logger.info(f"整篇文章处理成功: {full_document_result.get('concepts_processed', 0)} 个概念, {full_document_result.get('relations_processed', 0)} 个关系")
+                else:
+                    retry_count += 1
+                    logger.warning(f"整篇文章处理失败，尝试重试 {retry_count}/{MAX_RETRIES}")
+                    
+            except Exception as e:
+                retry_count += 1
+                logger.error(f"整篇文章处理异常 (尝试 {retry_count}/{MAX_RETRIES}): {str(e)}")
+        
+        if not success:
+            failed_chunks += 1
+            logger.error(f"整篇文章在 {MAX_RETRIES} 次尝试后仍然处理失败")
+        
+        # 第二步：分章节/分块提取（更细粒度的处理）
+        logger.info("=== 第二步：分章节/分块进行细粒度提取 ===")
+        chunks = split_text_with_overlap(text, chunk_size, overlap_size)
         
         # 处理每个块
         for i, (chunk_text, start_pos, end_pos) in enumerate(chunks):
@@ -157,25 +190,103 @@ def process_pdf_to_knowledge_graph(pdf_path: str, chunk_size: int = CHUNK_SIZE, 
                 failed_chunks += 1
                 logger.error(f"块 {chunk_id} 在 {MAX_RETRIES} 次尝试后仍然处理失败")
         
+        # 尝试基于标题分割章节（如果文本中有明显的章节标记）
+        logger.info("=== 第三步：尝试基于内容特征进行章节级提取 ===")
+        chapter_attempted = False
+        try:
+            # 简单的章节检测（基于常见的章节格式，如"1. 标题", "第一章", "Section 1"等）
+            import re
+            # 匹配常见的章节标记
+            chapter_markers = [
+                r'(?:\d+\.)+\s+[^\n]+',  # 1.1. 这样的标记
+                r'(?:第[一二三四五六七八九十百千]+章)\s+[^\n]+',  # 第一章 这样的标记
+                r'(?:Section|SECTION|Chapter|CHAPTER)\s+\d+\.?\s+[^\]+'  # Section 1 这样的标记
+            ]
+            
+            chapters = []
+            for marker in chapter_markers:
+                matches = list(re.finditer(marker, text))
+                if matches:
+                    # 提取章节内容
+                    for i in range(len(matches)):
+                        start = matches[i].start()
+                        if i < len(matches) - 1:
+                            end = matches[i + 1].start()
+                        else:
+                            end = len(text)
+                        chapter_text = text[start:end]
+                        chapters.append((chapter_text, start, end, matches[i].group()))
+                    chapter_attempted = True
+                    break
+            
+            # 处理检测到的章节
+            if chapters:
+                logger.info(f"检测到 {len(chapters)} 个章节，进行章节级提取")
+                for i, (chapter_text, start_pos, end_pos, chapter_title) in enumerate(chapters):
+                    chapter_id = i + 1
+                    logger.info(f"处理章节 {chapter_id}/{len(chapters)}: {chapter_title[:50]}... (字符位置: {start_pos}-{end_pos})")
+                    
+                    # 生成章节标识符
+                    source_document = f"{os.path.basename(pdf_path)}_chapter_{chapter_id}"
+                    
+                    # 尝试处理章节（带重试）
+                    retry_count = 0
+                    success = False
+                    
+                    while retry_count < MAX_RETRIES and not success:
+                        try:
+                            # 调用workflow处理当前章节
+                            result = workflow_main(text=chapter_text)
+                            
+                            if result:
+                                # 更新统计
+                                total_concepts += result.get('concepts_processed', 0)
+                                total_relations += result.get('relations_processed', 0)
+                                processed_chunks += 1
+                                success = True
+                                logger.info(f"章节 {chapter_id} 处理成功: {result.get('concepts_processed', 0)} 个概念, {result.get('relations_processed', 0)} 个关系")
+                            else:
+                                retry_count += 1
+                                logger.warning(f"章节 {chapter_id} 处理失败，尝试重试 {retry_count}/{MAX_RETRIES}")
+                                
+                        except Exception as e:
+                            retry_count += 1
+                            logger.error(f"章节 {chapter_id} 处理异常 (尝试 {retry_count}/{MAX_RETRIES}): {str(e)}")
+                    
+                    if not success:
+                        failed_chunks += 1
+                        logger.error(f"章节 {chapter_id} 在 {MAX_RETRIES} 次尝试后仍然处理失败")
+            else:
+                logger.info("未检测到明显的章节标记，跳过章节级提取")
+        except Exception as e:
+            logger.error(f"章节提取过程中出现异常: {str(e)}")
+            chapter_attempted = True
+        
         # 生成最终汇总报告
         summary = {
             "pdf_file": pdf_path,
-            "total_chunks": len(chunks),
+            "total_chunks": len(chunks) if 'chunks' in locals() else 0,
             "processed_chunks": processed_chunks,
             "failed_chunks": failed_chunks,
             "total_concepts_extracted": total_concepts,
             "total_relations_extracted": total_relations,
             "chunk_size": chunk_size,
-            "overlap_size": overlap_size
+            "overlap_size": overlap_size,
+            "extraction_method": "full_document_and_chunks",
+            "chapter_extraction_attempted": chapter_attempted
         }
         
         # 打印最终汇总
         logger.info("=== PDF知识图谱构建完成 ===")
         logger.info(f"PDF文件: {summary['pdf_file']}")
-        logger.info(f"处理块数: {summary['processed_chunks']}/{summary['total_chunks']}")
-        logger.info(f"失败块数: {summary['failed_chunks']}")
+        logger.info(f"处理策略: 三级提取（全文+分块+章节）")
+        logger.info(f"总处理单元数: {summary['processed_chunks']} 成功, {summary['failed_chunks']} 失败")
+        logger.info(f"分块总数: {summary['total_chunks']}")
+        logger.info(f"章节提取尝试: {'是' if summary['chapter_extraction_attempted'] else '否'}")
         logger.info(f"提取概念总数: {summary['total_concepts_extracted']}")
         logger.info(f"提取关系总数: {summary['total_relations_extracted']}")
+        logger.info("注：由于采用多重提取策略，部分概念和关系可能被重复提取，")
+        logger.info("但数据库层面会进行去重和合并处理，确保知识图谱的一致性。")
         
         return summary
         
