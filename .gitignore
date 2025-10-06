@@ -6,6 +6,9 @@ __pycache__/
 # Deprecated directories and files
 _deprecated/
 
+# Reports directory
+reports/
+
 # Documents directory
 documents/
 
@@ -36,6 +39,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Configuration files with sensitive information
+config.ini
 
 # Runtime data
 pids

@@ -17,14 +17,61 @@ class Neo4jKnowledgeGraph:
         os.makedirs(model_cache_dir, exist_ok=True)
         
         # 使用本地缓存加载多语言模型，更好地支持人名、缩写和不常见概念
-        # 首次调用时请设置为True!
-        self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', 
-                                      cache_folder=model_cache_dir,
-                                      local_files_only=True)
-        self.nlp = spacy.load("en_core_web_sm")  # 用于文本预处理
+        model_name = 'paraphrase-multilingual-MiniLM-L12-v2'
+        
+        # 先检查本地是否存在模型
+        try:
+            # 尝试只从本地加载模型
+            self.model = SentenceTransformer(model_name, 
+                                          cache_folder=model_cache_dir,
+                                          local_files_only=True)
+            logger.info(f"成功从本地加载模型: {model_name}")
+        except (OSError, FileNotFoundError):
+            # 如果本地不存在，则从网络下载
+            logger.info(f"本地模型不存在，开始从网络下载: {model_name}")
+            self.model = SentenceTransformer(model_name, 
+                                          cache_folder=model_cache_dir,
+                                          local_files_only=False)
+            logger.info(f"模型下载完成: {model_name}")
+        
+        # 检查并加载Spacy模型
+        spacy_model = "en_core_web_sm"
+        try:
+            # 尝试加载Spacy模型
+            self.nlp = spacy.load(spacy_model)
+            logger.info(f"成功加载Spacy模型: {spacy_model}")
+        except OSError:
+            # 如果模型不存在，尝试下载
+            logger.info(f"Spacy模型不存在，开始下载: {spacy_model}")
+            import subprocess
+            import sys
+            subprocess.check_call([sys.executable, "-m", "spacy", "download", spacy_model])
+            self.nlp = spacy.load(spacy_model)
+            logger.info(f"Spacy模型下载完成: {spacy_model}")
         
         # 初始化数据库索引
         self.__initialize_database_indexes()
+        
+        # 初始化统计变量
+        self.stats = {
+            'similarity_matches': {
+                'exact_match': 0,  # 精确匹配
+                'alias_match': 0,  # 别名匹配
+                'fuzzy_match': 0,  # 模糊匹配
+                'vector_match': 0,  # 向量相似度匹配
+                'context_match': 0  # 上下文匹配
+            },
+            'nodes': {
+                'new_concepts': 0,
+                'merged_concepts': 0,
+                'new_entities': 0,
+                'merged_entities': 0
+            },
+            'relations': {
+                'new_relations': 0,
+                'merged_relations': 0
+            }
+        }
     
     def __initialize_database_indexes(self):
         """创建必要的数据库索引"""
@@ -157,44 +204,72 @@ class Neo4jKnowledgeGraph:
             # 实体相似度阈值可以稍低，因为实体更具体
             threshold = 0.7
         
-        query = f"""
-        // 第一步: 名称精确匹配
-        MATCH (n:{label})
-        WHERE n.canonicalName = $canonical_name 
-           OR $name IN n.aliases
-        RETURN n.id AS node_id, n.name AS name, 1.0 AS similarity
-        LIMIT 1
-        
-        UNION
-        
-        // 第二步: 名称模糊匹配
-        MATCH (n:{label})
-        WHERE n.canonicalName CONTAINS $canonical_name 
-           OR ANY(alias IN n.aliases WHERE alias CONTAINS $name)
-        RETURN n.id AS node_id, n.name AS name, 0.8 AS similarity
-        LIMIT 5
-        
-        UNION
-        
-        // 第三步: 向量相似度搜索
-        CALL db.index.vector.queryNodes('{vector_index}', 10, $vector)
-        YIELD node AS n, score AS similarity
-        WHERE similarity > $threshold
-        RETURN n.id AS node_id, n.name AS name, similarity
-        """
-        
-        params = {
-            "name": node["name"],
-            "canonical_name": node["canonical_name"],
-            "vector": node["vector"],
-            "threshold": threshold
-        }
-        
+        # 分别执行不同的匹配查询，以便统计每种方法的贡献
         with self.driver.session() as session:
-            result = session.run(query, params)
-            # 转换结果字段名以匹配后续处理
-            return [{"concept_id": record["node_id"], "name": record["name"], "similarity": record["similarity"]} 
-                    for record in result]
+            # 1. 精确匹配查询
+            exact_match_query = f"""
+            MATCH (n:{label})
+            WHERE n.canonicalName = $canonical_name 
+            RETURN n.id AS node_id, n.name AS name, 'exact_match' AS match_type
+            LIMIT 1
+            """
+            exact_results = list(session.run(exact_match_query, 
+                                           canonical_name=node["canonical_name"]))
+            
+            if exact_results:
+                self.stats['similarity_matches']['exact_match'] += 1
+                return [{"concept_id": record["node_id"], "name": record["name"], "similarity": 1.0, "match_type": "exact_match"} 
+                        for record in exact_results]
+            
+            # 2. 别名匹配查询
+            alias_match_query = f"""
+            MATCH (n:{label})
+            WHERE $name IN n.aliases
+            RETURN n.id AS node_id, n.name AS name, 'alias_match' AS match_type
+            LIMIT 1
+            """
+            alias_results = list(session.run(alias_match_query, name=node["name"]))
+            
+            if alias_results:
+                self.stats['similarity_matches']['alias_match'] += 1
+                return [{"concept_id": record["node_id"], "name": record["name"], "similarity": 0.95, "match_type": "alias_match"} 
+                        for record in alias_results]
+            
+            # 3. 模糊匹配查询
+            fuzzy_match_query = f"""
+            MATCH (n:{label})
+            WHERE n.canonicalName CONTAINS $canonical_name 
+               OR ANY(alias IN n.aliases WHERE alias CONTAINS $name)
+            RETURN n.id AS node_id, n.name AS name, 'fuzzy_match' AS match_type
+            LIMIT 5
+            """
+            fuzzy_results = list(session.run(fuzzy_match_query, 
+                                           name=node["name"],
+                                           canonical_name=node["canonical_name"]))
+            
+            if fuzzy_results:
+                self.stats['similarity_matches']['fuzzy_match'] += 1
+                return [{"concept_id": record["node_id"], "name": record["name"], "similarity": 0.8, "match_type": "fuzzy_match"} 
+                        for record in fuzzy_results]
+            
+            # 4. 向量相似度搜索
+            vector_query = f"""
+            CALL db.index.vector.queryNodes('{vector_index}', 10, $vector)
+            YIELD node AS n, score AS similarity
+            WHERE similarity > $threshold
+            RETURN n.id AS node_id, n.name AS name, similarity, 'vector_match' AS match_type
+            """
+            vector_results = list(session.run(vector_query, 
+                                           vector=node["vector"],
+                                           threshold=threshold))
+            
+            if vector_results:
+                self.stats['similarity_matches']['vector_match'] += 1
+                return [{"concept_id": record["node_id"], "name": record["name"], "similarity": record["similarity"], "match_type": "vector_match"} 
+                        for record in vector_results]
+            
+            # 没有找到相似节点
+            return []
     
     def __merge_or_create_node(self, node, candidates):
         """根据相似度决定合并或创建新节点，对Concept和Entity使用不同的判断逻辑"""
@@ -211,6 +286,7 @@ class Neo4jKnowledgeGraph:
         if node_type == "Concept":
             # 概念相似度要求更高
             if best_candidate["similarity"] > 0.95:
+                self.stats['nodes']['merged_concepts'] += 1
                 return self.__merge_node(best_candidate["concept_id"], node)
             
             # 概念更注重上下文和语义关联
@@ -223,10 +299,14 @@ class Neo4jKnowledgeGraph:
             combined_similarity = 0.6 * best_candidate["similarity"] + 0.4 * context_similarity
             
             if combined_similarity > 0.92:
+                self.stats['nodes']['merged_concepts'] += 1
+                if context_similarity > 0.5:  # 如果上下文相似度较高，则记录上下文匹配
+                    self.stats['similarity_matches']['context_match'] += 1
                 return self.__merge_node(best_candidate["concept_id"], node)
         else:  # Entity
             # 实体更注重名称匹配
             if best_candidate["similarity"] > 0.9:
+                self.stats['nodes']['merged_entities'] += 1
                 return self.__merge_node(best_candidate["concept_id"], node)
             
             # 实体的上下文权重较低
@@ -238,9 +318,16 @@ class Neo4jKnowledgeGraph:
             combined_similarity = 0.8 * best_candidate["similarity"] + 0.2 * context_similarity
             
             if combined_similarity > 0.88:
+                self.stats['nodes']['merged_entities'] += 1
+                if context_similarity > 0.5:  # 如果上下文相似度较高，则记录上下文匹配
+                    self.stats['similarity_matches']['context_match'] += 1
                 return self.__merge_node(best_candidate["concept_id"], node)
         
         # 不符合合并条件，创建新节点
+        if node_type == "Concept":
+            self.stats['nodes']['new_concepts'] += 1
+        else:
+            self.stats['nodes']['new_entities'] += 1
         return self.__create_new_node(node)
     
     def __check_context_similarity(self, node_id, context):
@@ -272,6 +359,9 @@ class Neo4jKnowledgeGraph:
         if node["name"] not in aliases:
             aliases.append(node["name"])
             
+        # 获取description，默认为空字符串
+        description = node.get("description", "")
+            
         query = f"""
         CREATE (n:{node_type} {{
             id: apoc.create.uuid(),
@@ -290,7 +380,7 @@ class Neo4jKnowledgeGraph:
             result = session.run(query, 
                 name=node["name"],
                 canonical_name=node["canonical_name"],
-                description=node["description"],
+                description=description,
                 vector=node["vector"],
                 source_document=node["source_document"],
                 aliases=aliases,
@@ -306,7 +396,11 @@ class Neo4jKnowledgeGraph:
         # 确保名称也在别名列表中
         if new_node["name"] not in new_aliases:
             new_aliases.append(new_node["name"])
+            
+        # 获取新节点的description，默认为空字符串
+        new_description = new_node.get("description", "")
         
+        # 构建查询，处理description可能为空的情况
         query = """
         // 匹配Concept或Entity类型的节点
         MATCH (n) 
@@ -314,7 +408,12 @@ class Neo4jKnowledgeGraph:
         SET n.aliases = CASE WHEN size([alias IN $new_aliases WHERE NOT alias IN n.aliases]) > 0 
                              THEN [alias IN n.aliases] + [alias IN $new_aliases WHERE NOT alias IN n.aliases]
                              ELSE n.aliases END
-        SET n.description = n.description + '\n' + $new_description
+        SET n.description = CASE WHEN $new_description <> '' 
+                                THEN CASE WHEN n.description IS NOT NULL AND n.description <> '' 
+                                          THEN n.description + '\n' + $new_description
+                                          ELSE $new_description
+                                     END
+                                ELSE n.description END
         SET n.sourceDocuments = n.sourceDocuments + $source_document
         RETURN n.id AS node_id
         """
@@ -323,7 +422,7 @@ class Neo4jKnowledgeGraph:
             result = session.run(query, 
                 existing_id=existing_id,
                 new_aliases=new_aliases,
-                new_description=new_node["description"],
+                new_description=new_description,
                 source_document=new_node["source_document"]
             )
             record = result.single()
@@ -333,8 +432,8 @@ class Neo4jKnowledgeGraph:
         """插入节点到知识图谱
         
         Args:
-            nodes (list): 节点列表，每个节点为字典，包含name、type和description
-                           可选字段：context（上下文列表）和source_document（来源文档）
+            nodes (list): 节点列表，每个节点为字典，包含name和type
+                           可选字段：description（描述）、context（上下文列表）和source_document（来源文档）
             
         Returns:
             int: 成功处理的节点数量
@@ -349,7 +448,7 @@ class Neo4jKnowledgeGraph:
         for node in nodes:
             try:
                 # 验证必要字段
-                if 'name' not in node or 'description' not in node or 'type' not in node:
+                if 'name' not in node or 'type' not in node:
                     logger.warning(f"节点缺少必要字段: {node}")
                     continue
                 
@@ -365,7 +464,7 @@ class Neo4jKnowledgeGraph:
                 full_node = {
                     'name': node['name'],
                     'canonical_name': self.nlp(node['name'])[0].lemma_.lower() if self.nlp(node['name']) else node['name'].lower(),
-                    'description': node['description'],
+                    'description': node.get('description', ''),  # description现在是可选的，默认为空字符串
                     'type': node['type'],
                     'vector': node_vector,
                     'context': node.get('context', []),  # 使用节点中提供的上下文，默认为空列表
@@ -407,6 +506,12 @@ class Neo4jKnowledgeGraph:
         logger.info(f"节点处理完成: 总共处理 {processed_count} 个节点")
         logger.info(f"概念统计: 新增 {new_concepts_count} 个，合并 {merged_concepts_count} 个")
         logger.info(f"实体统计: 新增 {new_entities_count} 个，合并 {merged_entities_count} 个")
+        
+        # 更新全局统计变量
+        self.stats['nodes']['new_concepts'] = new_concepts_count
+        self.stats['nodes']['merged_concepts'] = merged_concepts_count
+        self.stats['nodes']['new_entities'] = new_entities_count
+        self.stats['nodes']['merged_entities'] = merged_entities_count
         
         return processed_count
     
@@ -553,6 +658,11 @@ class Neo4jKnowledgeGraph:
                     continue
         
         logger.info(f"关系处理完成: 共处理 {processed_count}/{len(relations)} 个关系，其中新增 {new_relations_count} 个，合并 {merged_relations_count} 个")
+        
+        # 更新全局统计变量
+        self.stats['relations']['new_relations'] = new_relations_count
+        self.stats['relations']['merged_relations'] = merged_relations_count
+        
         return processed_count
     
     def __check_existing_relations(self, session, source_id, target_id):

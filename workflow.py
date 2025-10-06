@@ -14,6 +14,7 @@ import os
 import json
 import logging
 import time
+import configparser
 from openai import OpenAI
 
 # 导入数据库模块
@@ -24,18 +25,31 @@ if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# 从配置文件读取配置
+config = configparser.ConfigParser()
+config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
+config.read(config_path)
+
 # 大模型配置
 LLM_CONFIG = {
-    "base_url": "http://localhost:8001/v1",
-    "api_key": "nd0aaKhNvMmCDWTVsIt5bdzg/hB1Ry31IZtFQB2FcT1W7bzpM7OjgFomLgACTR46hUqZMK0jlcULvCUaYJvRGg==",
-    "model": "deepseek-r1"
+    "base_url": config.get('LLM_CONFIG', 'base_url'),
+    "api_key": config.get('LLM_CONFIG', 'api_key'),
+    "model": config.get('LLM_CONFIG', 'model')
+}
+
+# 大模型额外配置
+LLM_EXTRA_CONFIG = {
+    "hy_source": config.get('LLM_EXTRA_CONFIG', 'hy_source'),
+    "hy_user": config.get('LLM_EXTRA_CONFIG', 'hy_user'),
+    "agent_id": config.get('LLM_EXTRA_CONFIG', 'agent_id'),
+    "should_remove_conversation": config.getboolean('LLM_EXTRA_CONFIG', 'should_remove_conversation')
 }
 
 # 数据库配置
 NEO4J_CONFIG = {
-    "uri": "neo4j://127.0.0.1:7687",
-    "user": "neo4j",
-    "password": "12345678"
+    "uri": config.get('NEO4J_CONFIG', 'uri'),
+    "user": config.get('NEO4J_CONFIG', 'user'),
+    "password": config.get('NEO4J_CONFIG', 'password')
 }
 
 # 系统提示词 - 要求输出nodes和relations结构化数据
@@ -72,13 +86,60 @@ system_prompt = """
 提取要求：
 1. 节点(nodes)列表应包含文本中所有重要的概念和实体
 2. 对于每个节点，请正确设置type字段：
-   - "Concept"：表示抽象的概念、理论、思想、学科等非实体事物
-   - "Entity"：表示现实中存在的具体事物、人物、组织、地点等
+   - "Concept"：表示抽象的概念、理论、思想、学科等非实体事物，或者实体所属的类别（如：手机、电脑、机器学习、自动社交编辑）
+   - "Entity"：表示现实中唯一存在的具体事物，必须满足以下条件：
+     * 不是类别或集合
+     * 不存在歧义
+     * 能够脱离任何语境单独存在
+     * 合法实体示例：2017年、iPhone 15、微软公司、北京市
+     * 非法实体示例：本文、笔者（依赖特定语境）、9月3日、David（存在歧义）、Iphone全球使用统计（不是单一存在）
 3. 每个节点需提供name(名称)、type(类型)和description(描述)，context(上下文)和source_document(来源)为可选
 4. 每个节点必须包含aliases字段，列出该节点的所有可能别称和缩写形式，即使文章中未直接提及
-5. 无论输入为何种语言，请优先使用中文全称作为name字段的第一标识符
+5. 无论输入为何种语言，无论原文中是否出现，请优先使用中文全称作为name字段的第一标识符
 6. 关系(relations)列表应包含节点之间的所有有意义的连接
 7. 关系必须包含source(源)、target(目标)和type(类型)，weight(权重)默认为1.0，properties(属性)为可选
+8. 请确保输出的JSON格式完全正确，可被程序直接解析
+"""
+
+system_prompt_simplified = """
+你现在的任务是从文本中提取知识图谱所需的结构化信息，包括节点(nodes)和关系(relations)。
+
+请严格按照以下JSON格式输出，不要包含任何其他内容：
+{
+  "nodes": [
+    {
+      "name": "节点名称",
+      "type": "Concept",  // 或 "Entity"
+      "aliases": ["别称1", "缩写1", "别称2"]
+    }
+    // 更多节点...
+  ],
+  "relations": [
+    {
+      "source": "源节点名称",
+      "target": "目标节点名称",
+      "type": "关系类型",
+      "weight" : 1.0
+    }
+    // 更多关系...
+  ]
+}
+
+提取要求：
+1. 节点(nodes)列表应包含文本中所有重要的概念和实体
+2. 对于每个节点，请正确设置type字段：
+   - "Concept"：表示抽象的概念、理论、思想、学科等非实体事物，或者实体所属的类别（如：手机、电脑、机器学习、自动社交编辑）
+   - "Entity"：表示现实中唯一存在的具体事物，必须满足以下条件：
+     * 不是类别或集合
+     * 不存在歧义
+     * 能够脱离任何语境单独存在
+     * 合法实体示例：2017年、iPhone 15、微软公司、北京市
+     * 非法实体示例：本文、笔者（依赖特定语境）、9月3日、David（存在歧义）、Iphone全球使用统计（不是单一存在）
+3. 每个节点需提供name(名称)、type(类型)
+4. 每个节点必须包含aliases字段，列出该节点的所有可能别称和缩写形式，即使文章中未直接提及
+5. 无论输入为何种语言，无论原文中是否出现，请优先使用中文全称作为name字段的第一标识符
+6. 关系(relations)列表应包含节点之间的所有有意义的连接
+7. 关系必须包含source(源)、target(目标)和type(类型)，weight(权重)默认为1.0
 8. 请确保输出的JSON格式完全正确，可被程序直接解析
 """
 
@@ -114,18 +175,13 @@ def call_llm(text, source_document="unknown"):
         )
         
         # 构建提示词，包含源文档信息
-        prompt = f"<systemprompt>{system_prompt}</systemprompt>\n<userinput>文本内容：{text}\n来源文档：{source_document}</userinput>"
+        prompt = f"<systemprompt>{system_prompt_simplified}</systemprompt>\n<userinput>文本内容：{text}\n来源文档：{source_document}</userinput>"
         
         response = client.chat.completions.create(
             model=LLM_CONFIG["model"],
             messages=[{"role": "user", "content": prompt}],
             stream=True,
-            extra_body={
-                "hy_source": "web",
-                "hy_user": "8fe2d96156694f6fac08fff143176d3e;",
-                "agent_id": "naQivTmsDa",
-                "should_remove_conversation": True
-            }
+            extra_body=LLM_EXTRA_CONFIG
         )
         
         # 处理流式响应 - 正确解析每个chunk的JSON
@@ -211,26 +267,29 @@ def call_llm(text, source_document="unknown"):
         logger.error(f"大模型调用失败: {str(e)}")
         raise
 
-def process_knowledge_graph(data, source_document="unknown"):
+def process_knowledge_graph(data, kg=None, source_document="unknown"):
     """
     处理知识图谱数据并插入数据库
     
     Args:
         data: 包含nodes和relations的字典
+        kg: 已初始化的Neo4jKnowledgeGraph实例（可选）
         source_document: 来源文档标识
         
     Returns:
         dict: 处理结果统计
     """
-    kg = None
+    local_kg = kg
     try:
-        # 初始化数据库连接
-        logger.info("初始化Neo4j数据库连接...")
-        kg = Neo4jKnowledgeGraph(
-            NEO4J_CONFIG["uri"],
-            NEO4J_CONFIG["user"],
-            NEO4J_CONFIG["password"]
-        )
+        # 如果没有提供kg实例，则创建一个
+        if local_kg is None:
+            # 初始化数据库连接
+            logger.info("初始化Neo4j数据库连接...")
+            local_kg = Neo4jKnowledgeGraph(
+                NEO4J_CONFIG["uri"],
+                NEO4J_CONFIG["user"],
+                NEO4J_CONFIG["password"]
+            )
         
         # 处理节点
         nodes = data.get('nodes', [])
@@ -246,13 +305,13 @@ def process_knowledge_graph(data, source_document="unknown"):
                 node['type'] = 'Concept'
         
         logger.info(f"开始插入 {len(nodes)} 个节点到数据库...")
-        node_count = kg.insert_nodes(nodes)
+        node_count = local_kg.insert_nodes(nodes)
         logger.info(f"成功插入 {node_count} 个节点")
         
         # 处理关系
         relations = data.get('relations', [])
         logger.info(f"开始插入 {len(relations)} 个关系到数据库...")
-        relation_count = kg.insert_relations(relations)
+        relation_count = local_kg.insert_relations(relations)
         logger.info(f"成功插入 {relation_count} 个关系")
         
         return {
@@ -265,18 +324,19 @@ def process_knowledge_graph(data, source_document="unknown"):
         logger.error(f"处理知识图谱数据失败: {str(e)}")
         raise
     finally:
-        # 确保关闭数据库连接
-        if kg:
-            kg.close()
+        # 只在本地创建的实例才关闭连接
+        if kg is None and local_kg:
+            local_kg.close()
             logger.info("数据库连接已关闭")
 
-def main(input_file=None, text=None):
+def main(input_file=None, text=None, kg=None):
     """
     主函数 - 知识图谱构建工作流
     
     Args:
         input_file: 输入文件路径
         text: 直接输入文本（如果不使用文件）
+        kg: 已初始化的Neo4jKnowledgeGraph实例（可选）
     """
     try:
         # 加载输入
@@ -293,7 +353,7 @@ def main(input_file=None, text=None):
         kg_data = call_llm(text, source_document)
         
         # 处理并存储到数据库
-        result = process_knowledge_graph(kg_data, source_document)
+        result = process_knowledge_graph(kg_data, kg, source_document)
         
         # 打印最终结果
         logger.info("=== 知识图谱构建完成 ===")
