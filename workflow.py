@@ -10,12 +10,14 @@
 4. 将概念和关系插入Neo4j数据库
 """
 
+from ast import parse
 import os
 import json
 import logging
 import time
 import configparser
 from openai import OpenAI
+from llm import LLMClient
 
 # 导入数据库模块
 from database import Neo4jKnowledgeGraph
@@ -96,7 +98,7 @@ system_prompt = """
 3. 每个节点需提供name(名称)、type(类型)和description(描述)，context(上下文)和source_document(来源)为可选
 4. 每个节点必须包含aliases字段，列出该节点的所有可能别称和缩写形式，即使文章中未直接提及
 5. 无论输入为何种语言，无论原文中是否出现，请优先使用中文全称作为name字段的第一标识符
-6. 关系(relations)列表应包含节点之间的所有有意义的连接
+6. 关系(relations)列表应包含节点之间的所有有意义的连接，关系类型请使用中文全称
 7. 关系必须包含source(源)、target(目标)和type(类型)，weight(权重)默认为1.0，properties(属性)为可选
 8. 请确保输出的JSON格式完全正确，可被程序直接解析
 """
@@ -138,7 +140,7 @@ system_prompt_simplified = """
 3. 每个节点需提供name(名称)、type(类型)
 4. 每个节点必须包含aliases字段，列出该节点的所有可能别称和缩写形式，即使文章中未直接提及
 5. 无论输入为何种语言，无论原文中是否出现，请优先使用中文全称作为name字段的第一标识符
-6. 关系(relations)列表应包含节点之间的所有有意义的连接
+6. 关系(relations)列表应包含节点之间的所有有意义的连接，关系类型请使用中文全称
 7. 关系必须包含source(源)、target(目标)和type(类型)，weight(权重)默认为1.0
 8. 请确保输出的JSON格式完全正确，可被程序直接解析
 """
@@ -165,61 +167,23 @@ def call_llm(text, source_document="unknown"):
     Returns:
         dict: 包含concepts和relations的字典
     """
-    try:
-        logger.info("开始调用大模型提取知识图谱数据...")
-        start_time = time.time()
+    # 构建完整的提示词
+    prompt = f"<systemprompt>{system_prompt_simplified}</systemprompt>\n<userinput>文本内容：{text}\n来源文档：{source_document}</userinput>"
+    
+    # 使用LLMClient类处理大模型调用
+    llm_client = LLMClient(LLM_CONFIG, LLM_EXTRA_CONFIG)
+    return llm_client.call_llm(prompt)
+
+def parse_kg_json_response(answer_str: str) -> dict[str, any]:
+        """
+        解析知识图谱JSON响应
         
-        client = OpenAI(
-            base_url=LLM_CONFIG["base_url"],
-            api_key=LLM_CONFIG["api_key"]
-        )
-        
-        # 构建提示词，包含源文档信息
-        prompt = f"<systemprompt>{system_prompt_simplified}</systemprompt>\n<userinput>文本内容：{text}\n来源文档：{source_document}</userinput>"
-        
-        response = client.chat.completions.create(
-            model=LLM_CONFIG["model"],
-            messages=[{"role": "user", "content": prompt}],
-            stream=True,
-            extra_body=LLM_EXTRA_CONFIG
-        )
-        
-        # 处理流式响应 - 正确解析每个chunk的JSON
-        think_str = ""
-        answer_str = ""
-        last_progress_length = 0  # 记录上一次显示进度时的长度
-        progress_interval = 500  # 进度显示间隔（字符数）
-        
-        for chunk in response:
-            content = chunk.choices[0].delta.content or ""
-            if content:
-                try:
-                    # 解析每个chunk的JSON数据
-                    chunk_data = json.loads(content)
-                    # 区分思考过程和最终回答
-                    if chunk_data.get("type") == "think":
-                        think_str += chunk_data.get("content", "")
-                    elif chunk_data.get("type") == "text":
-                        answer_str += chunk_data.get("msg", "")
-                    
-                    # 实时打印处理进度 - 当累积长度超过进度间隔时显示
-                    if len(answer_str) > last_progress_length + progress_interval:
-                        logger.info(f"大模型响应处理中...已累积{len(answer_str)}字符的结构化数据")
-                        last_progress_length = len(answer_str)
-                except json.JSONDecodeError:
-                    # 如果chunk不是有效的JSON，可能是直接的文本响应
-                    logger.warning(f"收到非JSON格式的响应chunk: {content[:50]}...")
-                    answer_str += content
-                    
-                    # 对于非JSON响应也显示进度
-                    if len(answer_str) > last_progress_length + progress_interval:
-                        logger.info(f"大模型响应处理中...已累积{len(answer_str)}字符的响应数据")
-                        last_progress_length = len(answer_str)
-        
-        logger.info(f"思考过程: {think_str[:200]}..." if think_str else "没有思考过程")
-        logger.info(f"最终回答内容前200字符: {answer_str[:200]}...")
-        
-        # 解析最终回答中的JSON知识图谱数据
+        Args:
+            answer_str: 模型返回的回答字符串
+            
+        Returns:
+            解析后的知识图谱数据字典
+        """
         try:
             # 清理可能的额外内容
             clean_answer = answer_str.strip()
@@ -239,7 +203,7 @@ def call_llm(text, source_document="unknown"):
             logger.info(f"清理后的JSON数据前200字符: {clean_answer[:200]}...")
             
             data = json.loads(clean_answer)
-            elapsed_time = time.time() - start_time
+            elapsed_time = time.time() - time.time()  # 重新计算
             logger.info(f"大模型调用完成，耗时: {elapsed_time:.2f}秒")
             logger.info(f"成功提取 {len(data.get('concepts', []))} 个概念和 {len(data.get('relations', []))} 个关系")
             
@@ -249,8 +213,7 @@ def call_llm(text, source_document="unknown"):
             logger.error(f"完整回答内容: {answer_str}")
             # 尝试使用正则表达式提取JSON
             try:
-                import re
-                json_pattern = r'\{(?:[^{}]|(?R))*\}'
+                json_pattern = r'\{(?:[^\{\}]|(?R))*\}'
                 matches = re.findall(json_pattern, answer_str)
                 if matches:
                     logger.info(f"找到 {len(matches)} 个可能的JSON对象，尝试第一个")
@@ -262,10 +225,6 @@ def call_llm(text, source_document="unknown"):
             except Exception as fallback_e:
                 logger.error(f"备用解析方法也失败: {str(fallback_e)}")
             raise
-            
-    except Exception as e:
-        logger.error(f"大模型调用失败: {str(e)}")
-        raise
 
 def process_knowledge_graph(data, kg=None, source_document="unknown"):
     """
@@ -350,7 +309,7 @@ def main(input_file=None, text=None, kg=None):
             raise ValueError("必须提供输入文本或文件路径")
         
         # 调用大模型提取知识
-        kg_data = call_llm(text, source_document)
+        kg_data = parse_kg_json_response(call_llm(text, source_document))
         
         # 处理并存储到数据库
         result = process_knowledge_graph(kg_data, kg, source_document)
@@ -371,7 +330,3 @@ if __name__ == "__main__":
     # 示例用法
     # 从文件处理
     main(input_file="userinput_半结构化文本.txt")
-    
-    # 或直接处理文本
-    # sample_text = "机器学习是人工智能的一个分支，专注于开发能够从数据中学习的系统。深度学习是机器学习的一个特殊形式，它使用多层神经网络。"
-    # main(text=sample_text)

@@ -462,17 +462,17 @@ def generate_visualizations(stats: Dict, report_dir: str, pdf_name: str):
     
     # 创建柱状图
     bars = ax2.bar(match_methods, match_percentages, color='skyblue')
-    ax2.set_title('相似度判断方法贡献')
-    ax2.set_xlabel('匹配方法')
-    ax2.set_ylabel('贡献比例 (%)')
+    ax2.set_title('相似度判断方法贡献', fontsize=14)
+    ax2.set_xlabel('匹配方法', fontsize=12)
+    ax2.set_ylabel('贡献比例 (%)', fontsize=12)
     ax2.set_ylim(0, 100)
-    plt.xticks(rotation=45, ha='right')
+    plt.xticks(rotation=45, ha='right', fontsize=10)
     
     # 在柱状图上方添加数值标签
     for bar in bars:
         height = bar.get_height()
         ax2.text(bar.get_x() + bar.get_width()/2., height + 1,
-                f'{height:.1f}%', ha='center', va='bottom')
+                f'{height:.1f}%', ha='center', va='bottom', fontsize=10)
     
     # 3. 新增vs合并对比柱状图
     ax3 = plt.subplot(2, 2, 3)
@@ -494,24 +494,26 @@ def generate_visualizations(stats: Dict, report_dir: str, pdf_name: str):
     ax3.bar([i - width/2 for i in x], new_values, width, label='新增', color='green')
     ax3.bar([i + width/2 for i in x], merged_values, width, label='合并', color='orange')
     
-    ax3.set_title('新增vs合并对比')
-    ax3.set_xlabel('类型')
-    ax3.set_ylabel('数量')
+    ax3.set_title('新增vs合并对比', fontsize=14)
+    ax3.set_xlabel('类型', fontsize=12)
+    ax3.set_ylabel('数量', fontsize=12)
     ax3.set_xticks(x)
-    ax3.set_xticklabels(categories)
-    ax3.legend()
+    ax3.set_xticklabels(categories, fontsize=10)
+    ax3.tick_params(axis='y', labelsize=10)
+    ax3.legend(fontsize=12)
     
     # 4. 相似度方法热力图
     ax4 = plt.subplot(2, 2, 4)
     # 创建一个简单的热力图数据
     heatmap_data = [match_counts]
     sns.heatmap(heatmap_data, annot=True, fmt='d', cmap='YlGnBu', ax=ax4,
-               xticklabels=match_methods, yticklabels=['匹配次数'])
-    ax4.set_title('相似度方法使用频次热力图')
-    plt.xticks(rotation=45, ha='right')
+               xticklabels=match_methods, yticklabels=['匹配次数'], annot_kws={'size': 12})
+    ax4.set_title('相似度方法使用频次热力图', fontsize=14)
+    plt.xticks(rotation=45, ha='right', fontsize=10)
+    ax4.tick_params(axis='y', labelsize=10)
     
     # 添加整体标题
-    fig.suptitle(f'知识图谱构建报告 - {pdf_name}', fontsize=16, y=0.98)
+    fig.suptitle(f'知识图谱构建报告 - {pdf_name}', fontsize=18, y=0.98)
     
     # 调整布局
     plt.tight_layout(rect=[0, 0, 1, 0.96])

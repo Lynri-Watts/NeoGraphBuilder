@@ -670,7 +670,7 @@ class Neo4jKnowledgeGraph:
         query = """
         MATCH (source)-[r]->(target)
         WHERE source.id = $source_id AND target.id = $target_id
-        RETURN id(r) AS id, type(r) AS type, properties(r) AS properties
+        RETURN elementId(r) AS id, type(r) AS type, properties(r) AS properties
         """
         result = session.run(query, source_id=source_id, target_id=target_id)
         return [record for record in result]
@@ -788,7 +788,7 @@ class Neo4jKnowledgeGraph:
         # 获取当前关系权重
         query = """
         MATCH ()-[r]->()
-        WHERE id(r) = $relation_id
+        WHERE elementId(r) = $relation_id
         RETURN r.weight AS current_weight, properties(r) AS props
         """
         
@@ -815,7 +815,7 @@ class Neo4jKnowledgeGraph:
         # 更新关系
         query = """
         MATCH ()-[r]->()
-        WHERE id(r) = $relation_id
+        WHERE elementId(r) = $relation_id
         SET r = r + $update_props
         """
         
@@ -844,7 +844,7 @@ class Neo4jKnowledgeGraph:
             if key not in ['weight', 'last_updated']:
                 query += f"\n        SET r.{key} = ${key}"
         
-        query += "\n        RETURN id(r) AS relation_id"
+        query += "\n        RETURN elementId(r) AS relation_id"
         
         result = session.run(query, params)
         record = result.single()
@@ -1079,3 +1079,136 @@ class Neo4jKnowledgeGraph:
         if self.driver:
             self.driver.close()
         logger.info("Database connection closed")
+    
+    def search_related_concepts(self, query_vector, top_k=5, threshold=0.6):
+        """
+        搜索与查询向量相关的概念
+        
+        Args:
+            query_vector: 查询向量
+            top_k: 返回的最大结果数
+            threshold: 相似度阈值
+            
+        Returns:
+            相关概念列表
+        """
+        with self.driver.session() as session:
+            query = """
+            CALL db.index.vector.queryNodes('concept_vector_index', $top_k, $vector)
+            YIELD node AS n, score AS similarity
+            WHERE similarity > $threshold
+            RETURN n.id AS id, n.name AS name, n.description AS description, 
+                   n.canonicalName AS canonical_name, similarity
+            ORDER BY similarity DESC
+            """
+            results = list(session.run(query, vector=query_vector.tolist(), 
+                                      top_k=top_k, threshold=threshold))
+            
+            return [{
+                'id': record['id'],
+                'name': record['name'],
+                'description': record['description'],
+                'canonical_name': record['canonical_name'],
+                'similarity': record['similarity']
+            } for record in results]
+    
+    def search_related_entities(self, query_vector, top_k=5, threshold=0.6):
+        """
+        搜索与查询向量相关的实体
+        
+        Args:
+            query_vector: 查询向量
+            top_k: 返回的最大结果数
+            threshold: 相似度阈值
+            
+        Returns:
+            相关实体列表
+        """
+        with self.driver.session() as session:
+            query = """
+            CALL db.index.vector.queryNodes('entity_vector_index', $top_k, $vector)
+            YIELD node AS n, score AS similarity
+            WHERE similarity > $threshold
+            RETURN n.id AS id, n.name AS name, n.description AS description, 
+                   n.canonicalName AS canonical_name, similarity
+            ORDER BY similarity DESC
+            """
+            results = list(session.run(query, vector=query_vector.tolist(), 
+                                      top_k=top_k, threshold=threshold))
+            
+            return [{
+                'id': record['id'],
+                'name': record['name'],
+                'description': record['description'],
+                'canonical_name': record['canonical_name'],
+                'similarity': record['similarity']
+            } for record in results]
+    
+    def get_node_relations(self, node_id, node_type, limit=5):
+        """
+        获取节点的相关关系
+        
+        Args:
+            node_id: 节点ID
+            node_type: 节点类型（Concept或Entity）
+            limit: 返回的最大关系数
+            
+        Returns:
+            关系列表
+        """
+        with self.driver.session() as session:
+            # 先构建带有正确节点标签的查询字符串
+            query = f"""
+            MATCH (n:{node_type}) 
+            WHERE n.id = $node_id
+            MATCH (n)-[r]-(related)
+            RETURN type(r) AS relation_type, 
+                   related.name AS related_name,
+                   labels(related)[0] AS related_node_type
+            LIMIT $limit
+            """
+            results = list(session.run(query, node_id=node_id, limit=limit))
+            
+            return [{
+                'relation_type': record['relation_type'],
+                'related_name': record['related_name'],
+                'related_node_type': record['related_node_type']
+            } for record in results]
+    
+    def search_knowledge_by_text(self, query_text, top_k=5):
+        """
+        基于文本搜索相关知识
+        
+        Args:
+            query_text: 查询文本
+            top_k: 返回的最大结果数
+            
+        Returns:
+            组合的相关知识列表
+        """
+        # 获取查询向量
+        query_vector = self.model.encode(query_text)
+        
+        # 搜索相关概念和实体
+        concepts = self.search_related_concepts(query_vector, top_k)
+        entities = self.search_related_entities(query_vector, top_k)
+        
+        # 合并结果并按相似度排序
+        all_results = []
+        for concept in concepts:
+            concept['node_type'] = 'Concept'
+            all_results.append(concept)
+        
+        for entity in entities:
+            entity['node_type'] = 'Entity'
+            all_results.append(entity)
+        
+        # 按相似度排序
+        all_results.sort(key=lambda x: x['similarity'], reverse=True)
+        
+        # 为每个结果添加关系信息
+        for result in all_results[:top_k]:
+            relations = self.get_node_relations(result['id'], result['node_type'])
+            result['relations'] = relations
+        
+        return all_results[:top_k]
