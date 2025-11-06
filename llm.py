@@ -32,7 +32,6 @@ class LLMClient:
     def call_llm(self, prompt: str) -> str:
         """
         唯一的开放接口，调用大模型获取流式响应并解析
-        只负责解析第一层JSON，获取大模型的回答内容
         
         Args:
             prompt: 完整的提示词内容
@@ -52,33 +51,49 @@ class LLMClient:
                 extra_body=self.extra_config
             )
             
-            # 处理流式响应 - 正确解析每个chunk的JSON
-            think_str = ""
-            answer_str = ""
+            # 累积所有响应内容
+            full_response = ""
             last_progress_length = 0  # 记录上一次显示进度时的长度
             progress_interval = 500  # 进度显示间隔（字符数）
             
             for chunk in response:
                 content = chunk.choices[0].delta.content or ""
                 if content:
-                    # 解析每个chunk的JSON数据
-                    chunk_data = json.loads(content)
-                    # 区分思考过程和最终回答
-                    if chunk_data.get("type") == "think":
-                        think_str += chunk_data.get("content", "")
-                    elif chunk_data.get("type") == "text":
-                        answer_str += chunk_data.get("msg", "")
+                    full_response += content
                     
-                    # 实时打印处理进度 - 当累积长度超过进度间隔时显示
-                    if len(answer_str) > last_progress_length + progress_interval:
-                        logger.info(f"大模型响应处理中...已累积{len(answer_str)}字符的结构化数据")
-                        last_progress_length = len(answer_str)
-
+                    # 实时打印处理进度
+                    if len(full_response) > last_progress_length + progress_interval:
+                        logger.info(f"大模型响应处理中...已累积{len(full_response)}字符")
+                        last_progress_length = len(full_response)
             
-            logger.info(f"最终回答内容前200字符: {answer_str[:200]}...")
+            logger.info(f"大模型调用完成，总响应长度: {len(full_response)}字符")
             
-            return answer_str
+            # 尝试解析完整的响应内容
+            try:
+                # 检查是否需要特殊处理（如果是知识图谱格式的响应）
+                if full_response.strip().startswith('{') and '"nodes"' in full_response and '"relations"' in full_response:
+                    # 这已经是知识图谱的JSON格式，直接返回
+                    return full_response
+                else:
+                    # 尝试解析为JSON看是否有msg字段
+                    try:
+                        response_data = json.loads(full_response)
+                        if isinstance(response_data, dict) and 'msg' in response_data:
+                            return response_data['msg']
+                    except:
+                        # 如果不是JSON或没有msg字段，直接返回原始响应
+                        pass
+                    
+                    # 最终返回原始响应内容
+                    return full_response
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON解析失败: {str(e)}，将返回原始响应内容")
+                logger.debug(f"原始响应内容: {full_response}")
+                # 返回原始内容，让上层处理
+                return full_response
             
         except Exception as e:
             logger.error(f"大模型调用失败: {str(e)}")
-            raise    
+            # 记录更详细的错误信息
+            logger.debug(f"错误类型: {type(e).__name__}")
+            raise

@@ -507,11 +507,11 @@ class Neo4jKnowledgeGraph:
         logger.info(f"概念统计: 新增 {new_concepts_count} 个，合并 {merged_concepts_count} 个")
         logger.info(f"实体统计: 新增 {new_entities_count} 个，合并 {merged_entities_count} 个")
         
-        # 更新全局统计变量
-        self.stats['nodes']['new_concepts'] = new_concepts_count
-        self.stats['nodes']['merged_concepts'] = merged_concepts_count
-        self.stats['nodes']['new_entities'] = new_entities_count
-        self.stats['nodes']['merged_entities'] = merged_entities_count
+        # 更新全局统计变量（累加而不是覆盖）
+        self.stats['nodes']['new_concepts'] += new_concepts_count
+        self.stats['nodes']['merged_concepts'] += merged_concepts_count
+        self.stats['nodes']['new_entities'] += new_entities_count
+        self.stats['nodes']['merged_entities'] += merged_entities_count
         
         return processed_count
     
@@ -566,7 +566,11 @@ class Neo4jKnowledgeGraph:
                     # 获取关系属性，设置默认值
                     rel_type = relation.get('type', 'RELATED_TO')
                     weight = relation.get('weight', 1.0)
-                    properties = relation.get('properties', {})
+                    properties = relation.get('properties', {}).copy()
+                    
+                    # 将根级别的source_document字段添加到properties中
+                    if 'source_document' in relation:
+                        properties['source_document'] = relation['source_document']
                     similarity_threshold = relation.get('similarity_threshold', 0.7)
                     
                     # 查找源节点和目标节点 - 支持Concept和Entity类型
@@ -659,9 +663,9 @@ class Neo4jKnowledgeGraph:
         
         logger.info(f"关系处理完成: 共处理 {processed_count}/{len(relations)} 个关系，其中新增 {new_relations_count} 个，合并 {merged_relations_count} 个")
         
-        # 更新全局统计变量
-        self.stats['relations']['new_relations'] = new_relations_count
-        self.stats['relations']['merged_relations'] = merged_relations_count
+        # 更新全局统计变量（累加而不是覆盖）
+        self.stats['relations']['new_relations'] += new_relations_count
+        self.stats['relations']['merged_relations'] += merged_relations_count
         
         return processed_count
     
@@ -804,12 +808,27 @@ class Neo4jKnowledgeGraph:
         # 计算新权重（使用加权平均）
         updated_weight = 0.7 * current_weight + 0.3 * new_weight
         
+        # 确保properties是字典
+        if properties is None:
+            properties = {}
+            
         # 更新属性
         update_props = {"weight": updated_weight, "last_updated": datetime.now().isoformat()}
+        
+        # 合并额外属性
         if properties:
-            # 合并额外属性，但不覆盖现有属性
             for key, value in properties.items():
-                if key not in update_props:
+                # 特别处理source_document字段，确保它不会丢失
+                if key == 'source_document':
+                    # 如果当前关系没有source_document或者需要合并多个来源
+                    if 'source_document' not in current_props:
+                        update_props[key] = value
+                    elif current_props['source_document'] != value:
+                        # 如果来源不同，可以考虑合并为列表或保留两者
+                        # 这里选择保留两者，用分号分隔
+                        current_src = current_props['source_document']
+                        update_props[key] = f"{current_src};{value}"
+                elif key not in update_props:
                     update_props[key] = value
         
         # 更新关系
@@ -824,6 +843,11 @@ class Neo4jKnowledgeGraph:
     
     def __create_new_relation(self, session, source_id, target_id, rel_type, weight, properties):
         """创建新关系"""
+        # 确保properties是字典
+        if properties is None:
+            properties = {}
+            
+        # 确保params包含所有必要字段和属性
         params = {
             'source_id': source_id,
             'target_id': target_id,
@@ -831,6 +855,7 @@ class Neo4jKnowledgeGraph:
             **properties
         }
         
+        # 构建基本查询，包含weight和last_updated
         query = f"""
         MATCH (source)
         WHERE source.id = $source_id
@@ -839,10 +864,10 @@ class Neo4jKnowledgeGraph:
         CREATE (source)-[r:{rel_type} {{weight: $weight, last_updated: datetime()}}]->(target)
         """
         
-        # 添加额外属性
-        for key, value in properties.items():
-            if key not in ['weight', 'last_updated']:
-                query += f"\n        SET r.{key} = ${key}"
+        # 添加所有额外属性，特别确保source_document被正确设置
+        if properties:
+            query += "\n        SET r += $props"
+            params['props'] = properties
         
         query += "\n        RETURN elementId(r) AS relation_id"
         
