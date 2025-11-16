@@ -5,6 +5,8 @@ import spacy
 import os
 import time
 import logging
+import traceback
+import json
 
 # 使用已配置的logger
 logger = logging.getLogger(__name__)
@@ -83,10 +85,10 @@ class Neo4jKnowledgeGraph:
             FOR (c:Concept) ON (c.name)
             """)
             
-            session.run("""
-            CREATE TEXT INDEX concept_canonical_name_index IF NOT EXISTS 
-            FOR (c:Concept) ON (c.canonicalName)
-            """)
+            # session.run("""
+            # CREATE TEXT INDEX concept_canonical_name_index IF NOT EXISTS 
+            # FOR (c:Concept) ON (c.canonicalName)
+            # """)
             
             session.run("""
             CREATE TEXT INDEX concept_aliases_index IF NOT EXISTS 
@@ -121,10 +123,10 @@ class Neo4jKnowledgeGraph:
             FOR (e:Entity) ON (e.name)
             """)
             
-            session.run("""
-            CREATE TEXT INDEX entity_canonical_name_index IF NOT EXISTS 
-            FOR (e:Entity) ON (e.canonicalName)
-            """)
+            # session.run("""
+            # CREATE TEXT INDEX entity_canonical_name_index IF NOT EXISTS 
+            # FOR (e:Entity) ON (e.canonicalName)
+            # """)
             
             session.run("""
             CREATE TEXT INDEX entity_aliases_index IF NOT EXISTS 
@@ -189,176 +191,59 @@ class Neo4jKnowledgeGraph:
             return [0.0] * self.model.get_sentence_embedding_dimension()
     
     def __find_similar_nodes(self, node):
-        """在Neo4j中查找相似节点，确保Concept和Entity永远不相似"""
+        """在Neo4j中只查找名称完全相同的节点"""
         node_type = node.get("type", "Concept")
+        label = "Concept" if node_type == "Concept" else "Entity"
         
-        # 根据节点类型设置不同的索引和查询参数
-        if node_type == "Concept":
-            label = "Concept"
-            vector_index = "concept_vector_index"
-            # 概念相似度阈值较高，因为概念更抽象
-            threshold = 0.75
-        else:  # Entity
-            label = "Entity"
-            vector_index = "entity_vector_index"
-            # 实体相似度阈值可以稍低，因为实体更具体
-            threshold = 0.7
-        
-        # 分别执行不同的匹配查询，以便统计每种方法的贡献
         with self.driver.session() as session:
-            # 1. 精确匹配查询
+            # 只进行精确名称匹配
             exact_match_query = f"""
             MATCH (n:{label})
-            WHERE n.canonicalName = $canonical_name 
-            RETURN n.id AS node_id, n.name AS name, 'exact_match' AS match_type
-            LIMIT 1
+            WHERE n.name = $name 
+            RETURN n.id AS node_id, n.name AS name
             """
             exact_results = list(session.run(exact_match_query, 
-                                           canonical_name=node["canonical_name"]))
+                                           name=node["name"]))
             
             if exact_results:
-                self.stats['similarity_matches']['exact_match'] += 1
-                return [{"concept_id": record["node_id"], "name": record["name"], "similarity": 1.0, "match_type": "exact_match"} 
-                        for record in exact_results]
+                return exact_results
             
-            # 2. 别名匹配查询
-            alias_match_query = f"""
-            MATCH (n:{label})
-            WHERE $name IN n.aliases
-            RETURN n.id AS node_id, n.name AS name, 'alias_match' AS match_type
-            LIMIT 1
-            """
-            alias_results = list(session.run(alias_match_query, name=node["name"]))
-            
-            if alias_results:
-                self.stats['similarity_matches']['alias_match'] += 1
-                return [{"concept_id": record["node_id"], "name": record["name"], "similarity": 0.95, "match_type": "alias_match"} 
-                        for record in alias_results]
-            
-            # 3. 模糊匹配查询
-            fuzzy_match_query = f"""
-            MATCH (n:{label})
-            WHERE n.canonicalName CONTAINS $canonical_name 
-               OR ANY(alias IN n.aliases WHERE alias CONTAINS $name)
-            RETURN n.id AS node_id, n.name AS name, 'fuzzy_match' AS match_type
-            LIMIT 5
-            """
-            fuzzy_results = list(session.run(fuzzy_match_query, 
-                                           name=node["name"],
-                                           canonical_name=node["canonical_name"]))
-            
-            if fuzzy_results:
-                self.stats['similarity_matches']['fuzzy_match'] += 1
-                return [{"concept_id": record["node_id"], "name": record["name"], "similarity": 0.8, "match_type": "fuzzy_match"} 
-                        for record in fuzzy_results]
-            
-            # 4. 向量相似度搜索
-            vector_query = f"""
-            CALL db.index.vector.queryNodes('{vector_index}', 10, $vector)
-            YIELD node AS n, score AS similarity
-            WHERE similarity > $threshold
-            RETURN n.id AS node_id, n.name AS name, similarity, 'vector_match' AS match_type
-            """
-            vector_results = list(session.run(vector_query, 
-                                           vector=node["vector"],
-                                           threshold=threshold))
-            
-            if vector_results:
-                self.stats['similarity_matches']['vector_match'] += 1
-                return [{"concept_id": record["node_id"], "name": record["name"], "similarity": record["similarity"], "match_type": "vector_match"} 
-                        for record in vector_results]
-            
-            # 没有找到相似节点
+            # 没有找到名称完全相同的节点
             return []
     
     def __merge_or_create_node(self, node, candidates):
-        """根据相似度决定合并或创建新节点，对Concept和Entity使用不同的判断逻辑"""
+        """只在名称完全相同时合并节点，否则创建新节点"""
         node_type = node.get("type", "Concept")
         
         # 如果没有候选，直接创建新节点
         if not candidates:
-            return self.__create_new_node(node)
+            node_id = self.__create_new_node(node)
+            return {"node_id": node_id, "is_new": True}
         
-        # 选择最佳候选
-        best_candidate = max(candidates, key=lambda x: x["similarity"])
-        
-        # 根据节点类型使用不同的相似度阈值
+        # 只有精确匹配（相似度为1.0）才合并
+        best_candidate = candidates[0]
+        # if best_candidate["similarity"] == 1.0:
         if node_type == "Concept":
-            # 概念相似度要求更高
-            if best_candidate["similarity"] > 0.95:
-                self.stats['nodes']['merged_concepts'] += 1
-                return self.__merge_node(best_candidate["concept_id"], node)
-            
-            # 概念更注重上下文和语义关联
-            context_similarity = self.__check_context_similarity(
-                best_candidate["concept_id"], 
-                node["context"]
-            )
-            
-            # 概念的上下文权重更高
-            combined_similarity = 0.6 * best_candidate["similarity"] + 0.4 * context_similarity
-            
-            if combined_similarity > 0.92:
-                self.stats['nodes']['merged_concepts'] += 1
-                if context_similarity > 0.5:  # 如果上下文相似度较高，则记录上下文匹配
-                    self.stats['similarity_matches']['context_match'] += 1
-                return self.__merge_node(best_candidate["concept_id"], node)
-        else:  # Entity
-            # 实体更注重名称匹配
-            if best_candidate["similarity"] > 0.9:
-                self.stats['nodes']['merged_entities'] += 1
-                return self.__merge_node(best_candidate["concept_id"], node)
-            
-            # 实体的上下文权重较低
-            context_similarity = self.__check_context_similarity(
-                best_candidate["concept_id"], 
-                node["context"]
-            )
-            
-            combined_similarity = 0.8 * best_candidate["similarity"] + 0.2 * context_similarity
-            
-            if combined_similarity > 0.88:
-                self.stats['nodes']['merged_entities'] += 1
-                if context_similarity > 0.5:  # 如果上下文相似度较高，则记录上下文匹配
-                    self.stats['similarity_matches']['context_match'] += 1
-                return self.__merge_node(best_candidate["concept_id"], node)
-        
-        # 不符合合并条件，创建新节点
-        if node_type == "Concept":
-            self.stats['nodes']['new_concepts'] += 1
+            self.stats['nodes']['merged_concepts'] += 1
         else:
-            self.stats['nodes']['new_entities'] += 1
-        return self.__create_new_node(node)
+            self.stats['nodes']['merged_entities'] += 1
+        node_id = self.__merge_node(best_candidate["node_id"], node)
+        return {"node_id": node_id, "is_new": False}
+        
+        # # 不符合合并条件，创建新节点
+        # if node_type == "Concept":
+        #     self.stats['nodes']['new_concepts'] += 1
+        # else:
+        #     self.stats['nodes']['new_entities'] += 1
+        # node_id = self.__create_new_node(node)
+        # return {"node_id": node_id, "is_new": True}
     
-    def __check_context_similarity(self, node_id, context):
-        """检查节点上下文相似度，同时查询Concept和Entity类型"""
-        query = """
-        // 同时查询Concept和Entity类型的节点
-        MATCH (n) 
-        WHERE n.id = $node_id AND (n:Concept OR n:Entity)
-        MATCH (n)-[:RELATED_TO]->(other)
-        WITH collect(other.name) AS related_nodes
-        
-        RETURN CASE WHEN size(related_nodes) > 0 
-                   THEN size([name IN related_nodes WHERE name IN $context]) * 1.0 / size(related_nodes) 
-                   ELSE 0 END AS context_similarity
-        """
-        
-        with self.driver.session() as session:
-            result = session.run(query, node_id=node_id, context=context)
-            record = result.single()
-            return record["context_similarity"] if record else 0
+    # __check_context_similarity方法已移除，不再需要检测上下文相似度
     
     def __create_new_node(self, node):
-        """创建新节点，根据类型创建Concept或Entity"""
+        """创建新节点，根据类型创建Concept或Entity，不再存储别名列表"""
         node_type = node.get("type", "Concept")
         
-        # 获取节点的别名列表，如果没有提供则默认为仅包含名称的列表
-        aliases = node.get("aliases", [])
-        # 确保名称也在别名列表中
-        if node["name"] not in aliases:
-            aliases.append(node["name"])
-            
         # 获取description，默认为空字符串
         description = node.get("description", "")
             
@@ -366,15 +251,19 @@ class Neo4jKnowledgeGraph:
         CREATE (n:{node_type} {{
             id: apoc.create.uuid(),
             name: $name,
-            canonicalName: $canonical_name,
-            aliases: $aliases,
             description: $description,
             embedding: $vector,
-            sourceDocuments: [$source_document],
+            sourceDocuments: $source_documents,
             type: $node_type
         }})
         RETURN n.id AS node_id
         """
+        
+        # 使用私有方法处理source_document字段
+        source_documents = self.__prepare_source_documents(node)
+        
+        # 将字典列表转换为JSON字符串列表，符合Neo4j属性类型要求
+        source_documents_json = [json.dumps(doc) for doc in source_documents]
         
         with self.driver.session() as session:
             result = session.run(query, 
@@ -382,48 +271,78 @@ class Neo4jKnowledgeGraph:
                 canonical_name=node["canonical_name"],
                 description=description,
                 vector=node["vector"],
-                source_document=node["source_document"],
-                aliases=aliases,
+                source_documents=source_documents_json,
                 node_type=node_type
             )
             record = result.single()
             return record["node_id"]
     
     def __merge_node(self, existing_id, new_node):
-        """合并到现有节点，同时合并别称列表"""
-        # 获取新节点的别名列表，如果没有提供则默认为空列表
-        new_aliases = new_node.get("aliases", [])
-        # 确保名称也在别名列表中
-        if new_node["name"] not in new_aliases:
-            new_aliases.append(new_node["name"])
-            
+        """合并到现有节点，不再合并别名列表，按文件名合并source_documents"""
         # 获取新节点的description，默认为空字符串
         new_description = new_node.get("description", "")
         
-        # 构建查询，处理description可能为空的情况
-        query = """
-        // 匹配Concept或Entity类型的节点
-        MATCH (n) 
-        WHERE n.id = $existing_id AND (n:Concept OR n:Entity)
-        SET n.aliases = CASE WHEN size([alias IN $new_aliases WHERE NOT alias IN n.aliases]) > 0 
-                             THEN [alias IN n.aliases] + [alias IN $new_aliases WHERE NOT alias IN n.aliases]
-                             ELSE n.aliases END
-        SET n.description = CASE WHEN $new_description <> '' 
-                                THEN CASE WHEN n.description IS NOT NULL AND n.description <> '' 
-                                          THEN n.description + '\n' + $new_description
-                                          ELSE $new_description
-                                     END
-                                ELSE n.description END
-        SET n.sourceDocuments = n.sourceDocuments + $source_document
-        RETURN n.id AS node_id
-        """
+        # 使用私有方法处理source_document字段
+        new_source_documents = self.__prepare_source_documents(new_node)
         
+        # 获取现有节点的sourceDocuments并合并去重
         with self.driver.session() as session:
-            result = session.run(query, 
+            # 先获取现有的sourceDocuments
+            get_existing_query = """
+            MATCH (n) 
+            WHERE n.id = $existing_id AND (n:Concept OR n:Entity)
+            RETURN n.sourceDocuments AS existing_docs
+            """
+            result = session.run(get_existing_query, existing_id=existing_id)
+            record = result.single()
+            existing_docs_json = record["existing_docs"] if record and record["existing_docs"] else []
+            
+            # 将现有的JSON字符串转换为字典列表
+            existing_docs = []
+            for doc_json in existing_docs_json:
+                try:
+                    doc = json.loads(doc_json)
+                    if isinstance(doc, dict):
+                        existing_docs.append(doc)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            
+            # 合并新文档，按文件名、标题、段落编号组合去重
+            merged_docs = existing_docs.copy()
+            for new_doc in new_source_documents:
+                # 检查是否已存在相同的文档
+                is_duplicate = False
+                for existing_doc in existing_docs:
+                    if (existing_doc.get('filename') == new_doc.get('filename') and
+                        existing_doc.get('title') == new_doc.get('title') and
+                        existing_doc.get('paragraph_number') == new_doc.get('paragraph_number')):
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    merged_docs.append(new_doc)
+            
+            # 将合并后的文档列表转换为JSON字符串列表
+            merged_docs_json = [json.dumps(doc) for doc in merged_docs]
+            
+            # 更新节点
+            update_query = """
+            MATCH (n) 
+            WHERE n.id = $existing_id AND (n:Concept OR n:Entity)
+            SET n.description = CASE WHEN $new_description <> '' 
+                                    THEN CASE WHEN n.description IS NOT NULL AND n.description <> '' 
+                                              THEN n.description + '\n' + $new_description
+                                              ELSE $new_description
+                                         END
+                                    ELSE n.description END,
+                n.sourceDocuments = $merged_docs_json
+            RETURN n.id AS node_id
+            """
+            
+            result = session.run(update_query, 
                 existing_id=existing_id,
-                new_aliases=new_aliases,
                 new_description=new_description,
-                source_document=new_node["source_document"]
+                merged_docs_json=merged_docs_json
             )
             record = result.single()
             return record["node_id"]
@@ -478,28 +397,75 @@ class Neo4jKnowledgeGraph:
                 similar_nodes = self.__find_similar_nodes(full_node)
                 
                 # 3. 合并或创建新节点
-                node_id = self.__merge_or_create_node(full_node, similar_nodes)
+                primary_node_id = self.__merge_or_create_node(full_node, similar_nodes)
                 
                 # 统计新增和合并的节点，按类型分类
                 if node['type'] == 'Concept':
-                    if similar_nodes and any(c['similarity'] > 0.8 for c in similar_nodes):
+                    if similar_nodes:  # 有相似节点说明找到了精确匹配，需要合并
                         merged_concepts_count += 1
-                        logger.info(f"已合并概念 '{node['name']}' -> ID: {node_id}")
+                        logger.info(f"已合并概念 '{node['name']}' -> ID: {primary_node_id}")
                     else:
                         new_concepts_count += 1
-                        logger.info(f"已新增概念 '{node['name']}' -> ID: {node_id}")
+                        logger.info(f"已新增概念 '{node['name']}' -> ID: {primary_node_id}")
                 else:  # Entity
-                    if similar_nodes and any(c['similarity'] > 0.8 for c in similar_nodes):
+                    if similar_nodes:  # 有相似节点说明找到了精确匹配，需要合并
                         merged_entities_count += 1
-                        logger.info(f"已合并实体 '{node['name']}' -> ID: {node_id}")
+                        logger.info(f"已合并实体 '{node['name']}' -> ID: {primary_node_id}")
                     else:
                         new_entities_count += 1
-                        logger.info(f"已新增实体 '{node['name']}' -> ID: {node_id}")
+                        logger.info(f"已新增实体 '{node['name']}' -> ID: {primary_node_id}")
+                
+                # 处理别名列表，为每个别名创建新节点并建立IS_ALIAS关系
+                aliases = node.get('aliases', [])
+                source_document = node.get('source_document', 'manual_insert')
+                
+                for alias in aliases:
+                    # 跳过与主名称相同的别名
+                    if alias == node['name']:
+                        continue
+                    
+                    # 创建别名节点
+                    alias_node = {
+                        'name': alias,
+                        'type': node['type'],
+                        'description': f"别名: {node['name']}",
+                        'source_document': source_document,
+                        'canonical_name': self.nlp(alias)[0].lemma_.lower() if self.nlp(alias) else alias.lower(),
+                        'vector': self.__generate_vector(alias),
+                        'context': node.get('context', [])
+                    }
+                    
+                    # 查找别名节点是否已存在（精确匹配）
+                    alias_similar_nodes = self.__find_similar_nodes(alias_node)
+                    alias_node_id = self.__merge_or_create_node(alias_node, alias_similar_nodes)
+                    
+                    # 更新统计信息
+                    if node['type'] == 'Concept':
+                        if alias_similar_nodes:  # 有相似节点说明找到了精确匹配，需要合并
+                            merged_concepts_count += 1
+                            logger.info(f"已合并别名概念 '{alias}' -> ID: {alias_node_id}")
+                        else:
+                            new_concepts_count += 1
+                            logger.info(f"已新增别名概念 '{alias}' -> ID: {alias_node_id}")
+                    else:  # Entity
+                        if alias_similar_nodes:  # 有相似节点说明找到了精确匹配，需要合并
+                            merged_entities_count += 1
+                            logger.info(f"已合并别名实体 '{alias}' -> ID: {alias_node_id}")
+                        else:
+                            new_entities_count += 1
+                            logger.info(f"已新增别名实体 '{alias}' -> ID: {alias_node_id}")
+                    
+                    # 创建双向IS_ALIAS关系
+                    # 提取实际的节点ID字符串
+                    primary_id = primary_node_id['node_id'] if isinstance(primary_node_id, dict) else primary_node_id
+                    alias_id = alias_node_id['node_id'] if isinstance(alias_node_id, dict) else alias_node_id
+                    self.__create_alias_relations(primary_id, alias_id, source_document)
                 
                 processed_count += 1
                 
             except Exception as e:
                 logger.error(f"处理节点 '{node.get('name', 'Unknown')}' 时出错: {str(e)}")
+                logger.error(f"完整错误堆栈:\n{traceback.format_exc()}")
                 continue
         
         # 输出最终统计信息
@@ -514,37 +480,85 @@ class Neo4jKnowledgeGraph:
         self.stats['nodes']['merged_entities'] += merged_entities_count
         
         return processed_count
-    
-    def insert_concepts(self, concepts):
-        """兼容旧版本的概念插入方法，将概念转换为节点后插入
+        
+    def __create_alias_relations(self, primary_node_id, alias_node_id, source_document):
+        """
+        创建两个节点之间的双向IS_ALIAS关系，使用MERGE避免重复创建
         
         Args:
-            concepts (list): 概念列表，每个概念为字典
-            
-        Returns:
-            int: 成功处理的概念数量
+            primary_node_id: 主节点ID
+            alias_node_id: 别名节点ID
+            source_document: 源文档信息（字典或字符串）
         """
-        # 将概念转换为默认类型为Concept的节点
-        nodes = []
-        for concept in concepts:
-            node = concept.copy()
-            node['type'] = 'Concept'
-            nodes.append(node)
-        
-        # 调用新的节点插入方法
-        return self.insert_nodes(nodes)
+        # 确保source_document是标准的字典格式
+        if not isinstance(source_document, dict):
+            source_document = {"filename": str(source_document), "title": "", "paragraph_number": None}
+            
+        # 将字典转换为JSON字符串，符合Neo4j关系属性类型要求
+        source_document_json = json.dumps(source_document)
+            
+        with self.driver.session() as session:
+            try:
+                # 使用MERGE创建从别名到主节点的IS_ALIAS关系，避免重复
+                alias_to_primary_query = """
+                MATCH (alias)
+                WHERE alias.id = $alias_node_id
+                MATCH (primary)
+                WHERE primary.id = $primary_node_id
+                MERGE (alias)-[r:IS_ALIAS]->(primary)
+                ON CREATE SET r.source_document = $source_document, r.created_at = datetime()
+                ON MATCH SET r.source_document = $source_document
+                RETURN elementId(r) as relation_id
+                """
+                
+                # 使用MERGE创建从主节点到别名的IS_ALIAS关系，避免重复
+                primary_to_alias_query = """
+                MATCH (primary)
+                WHERE primary.id = $primary_node_id
+                MATCH (alias)
+                WHERE alias.id = $alias_node_id
+                MERGE (primary)-[r:IS_ALIAS]->(alias)
+                ON CREATE SET r.source_document = $source_document, r.created_at = datetime()
+                ON MATCH SET r.source_document = $source_document
+                RETURN elementId(r) as relation_id
+                """
+                
+                # 执行第一个关系创建/合并
+                result1 = session.run(alias_to_primary_query, 
+                                     alias_node_id=alias_node_id, 
+                                     primary_node_id=primary_node_id, 
+                                     source_document=source_document_json)
+                rel1_record = result1.single()
+                
+                # 执行第二个关系创建/合并
+                result2 = session.run(primary_to_alias_query, 
+                                     alias_node_id=alias_node_id, 
+                                     primary_node_id=primary_node_id, 
+                                     source_document=source_document_json)
+                rel2_record = result2.single()
+                
+                if rel1_record and rel2_record:
+                    logger.info(f"已成功创建/合并双向IS_ALIAS关系: {alias_node_id} <-> {primary_node_id}")
+                    logger.info(f"关系ID: {rel1_record['relation_id']} 和 {rel2_record['relation_id']}")
+                else:
+                    logger.error(f"创建/合并IS_ALIAS关系失败: {alias_node_id} <-> {primary_node_id}")
+                    
+            except Exception as e:
+                logger.error(f"创建/合并IS_ALIAS关系时出错: {str(e)}")
+                logger.error(f"主节点ID: {primary_node_id}, 别名节点ID: {alias_node_id}")
+                raise
+    
+
     
     def insert_relations(self, relations):
-        """插入关系到知识图谱
+        """插入关系到知识图谱，只按节点名称精确匹配，并在关系存在时合并source_document列表
         
         Args:
             relations (list): 关系列表，每个关系为字典，包含以下字段：
-                            - source: 源节点名称
-                            - target: 目标节点名称
+                            - source: 源节点名称（精确匹配）
+                            - target: 目标节点名称（精确匹配）
                             - type: 关系类型（默认为'RELATED_TO'）
-                            - weight: 关系权重（默认为1.0）
-                            - properties: 可选的额外属性字典
-                            - similarity_threshold: 相似度阈值（默认为0.7）
+                            - source_document: 源文档信息（可选，字典或字典列表，包含filename、title和paragraph_number字段）
             
         Returns:
             int: 成功处理的关系数量
@@ -563,446 +577,191 @@ class Neo4jKnowledgeGraph:
                         logger.warning(f"关系缺少必要字段: {relation}")
                         continue
                     
-                    # 获取关系属性，设置默认值
+                    # 获取关系类型，设置默认值
                     rel_type = relation.get('type', 'RELATED_TO')
-                    weight = relation.get('weight', 1.0)
-                    properties = relation.get('properties', {}).copy()
                     
-                    # 将根级别的source_document字段添加到properties中
-                    if 'source_document' in relation:
-                        properties['source_document'] = relation['source_document']
-                    similarity_threshold = relation.get('similarity_threshold', 0.7)
+                    # 使用私有方法处理source_document字段
+                    source_documents = self.__prepare_source_documents(relation)
                     
-                    # 查找源节点和目标节点 - 支持Concept和Entity类型
-                    source_node_query = """
+                    # 精确查找源节点和目标节点 - 只按名称精确匹配
+                    exact_node_query = """
                     MATCH (n)
-                    WHERE (n:Concept OR n:Entity) AND 
-                          (n.name = $name OR $name IN n.aliases OR 
-                           n.canonicalName = $canonical_name)
-                    RETURN n.id AS node_id, n.name AS name, labels(n)[0] AS type,
-                           n.embedding AS embedding
-                    ORDER BY CASE 
-                        WHEN n.name = $name THEN 3
-                        WHEN $name IN n.aliases THEN 2
-                        WHEN n.canonicalName = $canonical_name THEN 1
-                        ELSE 0 
-                    END DESC
-                    LIMIT 10
+                    WHERE (n:Concept OR n:Entity) AND n.name = $name
+                    RETURN n.id AS node_id, n.name AS name, labels(n)[0] AS type
+                    LIMIT 1
                     """
                     
-                    # 准备参数
-                    source_canonical = self.nlp(relation['source'])[0].lemma_.lower() if self.nlp(relation['source']) else relation['source'].lower()
-                    target_canonical = self.nlp(relation['target'])[0].lemma_.lower() if self.nlp(relation['target']) else relation['target'].lower()
+                    # 查询源节点（精确匹配）
+                    source_result = session.run(exact_node_query, name=relation['source'])
+                    source_record = source_result.single()
                     
-                    # 查询源节点
-                    source_nodes = session.run(source_node_query, 
-                                             name=relation['source'], 
-                                             canonical_name=source_canonical)
-                    source_nodes = list(source_nodes)
-                    
-                    # 查询目标节点
-                    target_nodes = session.run(source_node_query, 
-                                             name=relation['target'], 
-                                             canonical_name=target_canonical)
-                    target_nodes = list(target_nodes)
-                    
-                    if not source_nodes:
-                        logger.warning(f"找不到与'{relation['source']}'相关的节点（Concept或Entity）")
+                    if not source_record:
+                        logger.warning(f"找不到名称为'{relation['source']}'的节点")
                         continue
                     
-                    if not target_nodes:
-                        logger.warning(f"找不到与'{relation['target']}'相关的节点（Concept或Entity）")
+                    # 查询目标节点（精确匹配）
+                    target_result = session.run(exact_node_query, name=relation['target'])
+                    target_record = target_result.single()
+                    
+                    if not target_record:
+                        logger.warning(f"找不到名称为'{relation['target']}'的节点")
                         continue
                     
-                    # 选择最佳匹配节点
-                    source_node = source_nodes[0]
-                    target_node = target_nodes[0]
+                    source_id = source_record['node_id']
+                    source_type = source_record['type']
+                    actual_source_name = source_record['name']
                     
-                    source_id = source_node['node_id']
-                    source_type = source_node['type']
-                    actual_source_name = source_node['name']
-                    
-                    target_id = target_node['node_id']
-                    target_type = target_node['type']
-                    actual_target_name = target_node['name']
+                    target_id = target_record['node_id']
+                    target_type = target_record['type']
+                    actual_target_name = target_record['name']
                     
                     logger.info(f"找到关系对应的节点: {actual_source_name}({source_type}) -> {actual_target_name}({target_type})")
+                    logger.info(f"准备创建关系，关系类型: {rel_type}")
                     
-                    # 检查现有关系
-                    existing_relations = self.__check_existing_relations(session, source_id, target_id)
+                    # 检查是否已存在相同类型的关系，同时获取现有关系的source_documents
+                    # 由于Neo4j不支持在关系类型位置使用参数，我们需要动态构建查询
+                    check_relation_query = f"""
+                    MATCH (source)-[r:{rel_type}]->(target)
+                    WHERE source.id = $source_id AND target.id = $target_id
+                    RETURN elementId(r) AS id, r.source_documents AS existing_docs
+                    LIMIT 1
+                    """
                     
-                    if existing_relations:
-                        # 关系已存在，检查是否相似
-                        relation_exists = False
-                        for existing_rel in existing_relations:
-                            if self.__verify_relation_similarity(existing_rel, rel_type, properties):
-                                # 关系相似，合并权重
-                                self.__merge_relation_weights(session, existing_rel['id'], weight, properties)
-                                logger.info(f"已合并相似关系: '{actual_source_name}'({source_type}) -[{rel_type}]-> '{actual_target_name}'({target_type}) (ID: {existing_rel['id']})")
-                                relation_exists = True
-                                merged_relations_count += 1
-                                processed_count += 1
-                                break
+                    logger.info(f"准备执行关系检查查询，关系类型: {rel_type}")
+                    logger.info(f"源节点ID: {source_id}, 目标节点ID: {target_id}")
+                    existing_rel = session.run(check_relation_query, 
+                                             source_id=source_id, 
+                                             target_id=target_id).single()
+                    
+                    logger.info(f"关系检查结果: {existing_rel}")
+                    
+                    if existing_rel:
+                        # 相同类型的关系已存在
+                        relation_id = existing_rel['id']
+                        existing_docs = existing_rel['existing_docs'] or []
                         
-                        if not relation_exists:
-                            # 关系不相似，创建新关系
-                            new_rel_id = self.__create_new_relation(session, source_id, target_id, rel_type, weight, properties)
-                            logger.info(f"已创建不同类型关系: '{actual_source_name}'({source_type}) -[{rel_type}]-> '{actual_target_name}'({target_type}) (ID: {new_rel_id})")
-                            new_relations_count += 1
-                            processed_count += 1
+                        logger.info(f"现有关系ID: {relation_id}, 现有文档: {existing_docs}, 类型: {type(existing_docs)}")
+                        
+                        # 统一格式：将existing_docs转换为字典列表
+                        normalized_existing_docs = []
+                        
+                        # 处理existing_docs的各种可能格式
+                        if isinstance(existing_docs, str):
+                            # 如果是字符串，尝试解析为JSON
+                            try:
+                                parsed = json.loads(existing_docs)
+                                if isinstance(parsed, str):
+                                    # 如果解析后还是字符串，再解析一次
+                                    normalized_existing_docs = [json.loads(parsed)]
+                                elif isinstance(parsed, list):
+                                    # 如果是列表，处理每个元素
+                                    normalized_existing_docs = self._normalize_document_list(parsed)
+                                elif isinstance(parsed, dict):
+                                    # 如果是字典，直接添加
+                                    normalized_existing_docs = [parsed]
+                            except json.JSONDecodeError:
+                                logger.warning(f"无法解析JSON字符串: {existing_docs}")
+                                normalized_existing_docs = []
+                        elif isinstance(existing_docs, list):
+                            # 如果是列表，标准化每个元素
+                            normalized_existing_docs = self._normalize_document_list(existing_docs)
+                        else:
+                            # 其他情况设为空列表
+                            normalized_existing_docs = []
+                        
+                        # 合并source_documents列表，按文件名去重
+                        if source_documents:
+                            # 合并并按文件名、标题、段落编号组合去重
+                            merged_docs = normalized_existing_docs.copy()
+                            # 创建现有文档的标识集合，包含文件名、标题和段落编号的组合
+                            existing_doc_identifiers = set()
+                            for existing_doc in merged_docs:
+                                # 获取文档的标识信息，缺少的字段使用None
+                                filename = existing_doc.get('filename', None)
+                                title = existing_doc.get('title', None)
+                                paragraph_number = existing_doc.get('paragraph_number', None)
+                                # 创建唯一标识元组
+                                doc_identifier = (filename, title, paragraph_number)
+                                existing_doc_identifiers.add(doc_identifier)
+                            
+                            # 添加不存在的文档
+                            for doc in source_documents:
+                                # 获取当前文档的标识信息
+                                filename = doc.get('filename', None)
+                                title = doc.get('title', None)
+                                paragraph_number = doc.get('paragraph_number', None)
+                                doc_identifier = (filename, title, paragraph_number)
+                                
+                                # 如果标识不存在，则添加文档
+                                if doc_identifier not in existing_doc_identifiers:
+                                    merged_docs.append(doc)
+                                    existing_doc_identifiers.add(doc_identifier)
+                            
+                            # 更新关系的source_documents
+                            # 将merged_docs字典列表转换为JSON字符串列表，符合Neo4j关系属性类型要求
+                            merged_docs_json = [json.dumps(doc) for doc in merged_docs]
+                            update_query = """
+                            MATCH ()-[r]->()
+                            WHERE elementId(r) = $relation_id
+                            SET r.source_documents = $merged_docs, r.last_updated = datetime()
+                            """
+                            
+                            session.run(update_query, relation_id=relation_id, merged_docs=merged_docs_json)
+                            logger.info(f"已更新关系的源文档列表: '{actual_source_name}'({source_type}) -[{rel_type}]-> '{actual_target_name}'({target_type}) (ID: {relation_id})")
+                            merged_relations_count += 1
+                        else:
+                            logger.info(f"关系已存在: '{actual_source_name}'({source_type}) -[{rel_type}]-> '{actual_target_name}'({target_type})")
                     else:
-                        # 关系不存在，创建新关系
-                        new_rel_id = self.__create_new_relation(session, source_id, target_id, rel_type, weight, properties)
-                        logger.info(f"已创建新关系: '{actual_source_name}'({source_type}) -[{rel_type}]-> '{actual_target_name}'({target_type}) (ID: {new_rel_id})")
-                        new_relations_count += 1
-                        processed_count += 1
+                        # 创建新关系，包含source_documents字段
+                        # 由于Neo4j不支持在关系类型位置使用参数，我们需要动态构建查询
+                        create_relation_query = f"""
+                        MATCH (source)
+                        WHERE source.id = $source_id
+                        MATCH (target)
+                        WHERE target.id = $target_id
+                        CREATE (source)-[r:{rel_type} {{created_at: datetime()}}]->(target)
+                        """
                         
+                        # 如果有source_documents，添加到关系中
+                        if source_documents:
+                            # 将source_documents字典列表转换为JSON字符串列表，符合Neo4j关系属性类型要求
+                            source_docs_json = [json.dumps(doc) for doc in source_documents]
+                            create_relation_query += "\nSET r.source_documents = $source_documents"
+                            params = {'source_id': source_id, 'target_id': target_id, 'source_documents': source_docs_json}
+                            logger.info(f"创建关系时包含source_documents: {len(source_documents)}个文档")
+                            for i, doc in enumerate(source_documents):
+                                logger.info(f"文档{i+1}: {doc.get('filename', '未知')}, 标题: {doc.get('title', '无')}, 段落: {doc.get('paragraph_number', '无')}")
+                        else:
+                            params = {'source_id': source_id, 'target_id': target_id}
+                            logger.info("创建关系时不包含source_documents")
+                        
+                        create_relation_query += "\nRETURN elementId(r) AS relation_id"
+                        logger.info(f"准备执行创建关系查询，关系类型: {rel_type}")
+                        result = session.run(create_relation_query, **params)
+                        
+                        new_rel_record = result.single()
+                        if new_rel_record:
+                            new_rel_id = new_rel_record['relation_id']
+                            logger.info(f"已创建新关系: '{actual_source_name}'({source_type}) -[{rel_type}]-> '{actual_target_name}'({target_type}) (ID: {new_rel_id})")
+                            new_relations_count += 1
+                    
+                    processed_count += 1
+                    
                 except Exception as e:
                     logger.error(f"处理关系时出错: {str(relation)} - {str(e)}")
                     continue
         
-        logger.info(f"关系处理完成: 共处理 {processed_count}/{len(relations)} 个关系，其中新增 {new_relations_count} 个，合并 {merged_relations_count} 个")
+        logger.info(f"关系处理完成: 共处理 {processed_count}/{len(relations)} 个关系，其中新增 {new_relations_count} 个，更新 {merged_relations_count} 个")
         
-        # 更新全局统计变量（累加而不是覆盖）
+        # 更新全局统计变量
         self.stats['relations']['new_relations'] += new_relations_count
         self.stats['relations']['merged_relations'] += merged_relations_count
         
         return processed_count
     
-    def __check_existing_relations(self, session, source_id, target_id):
-        """检查源节点和目标节点之间是否存在关系"""
-        query = """
-        MATCH (source)-[r]->(target)
-        WHERE source.id = $source_id AND target.id = $target_id
-        RETURN elementId(r) AS id, type(r) AS type, properties(r) AS properties
-        """
-        result = session.run(query, source_id=source_id, target_id=target_id)
-        return [record for record in result]
-    
-    def __verify_relation_similarity(self, existing_rel, new_type, new_properties):
-        """基于语义相似度验证关系是否相似
-        
-        判断标准：
-        1. 关系类型基于语义相似度比较
-        2. 属性基于语义相似度比较
-        
-        Returns:
-            bool: 如果关系语义相似则返回True，否则返回False
-        """
-        # 设置相似度阈值
-        type_similarity_threshold = 0.8
-        property_similarity_threshold = 0.7
-        
-        # 计算关系类型的语义相似度
-        existing_type = existing_rel['type']
-        type_similarity = self.__calculate_text_similarity(existing_type, new_type)
-        
-        logger.debug(f"关系类型语义相似度: '{existing_type}' vs '{new_type}' = {type_similarity:.4f}")
-        
-        # 如果关系类型语义不相似，直接返回False
-        if type_similarity < type_similarity_threshold:
-            return False
-        
-        # 检查属性语义相似度
-        existing_props = existing_rel['properties']
-        
-        # 对所有非weight和last_updated的属性进行语义比较
-        for key, new_value in new_properties.items():
-            if key in ['weight', 'last_updated']:
-                continue
-                
-            if key in existing_props:
-                existing_value = existing_props[key]
-                # 只对字符串类型的值进行语义比较
-                if isinstance(existing_value, str) and isinstance(new_value, str):
-                    prop_similarity = self.__calculate_text_similarity(existing_value, new_value)
-                    logger.debug(f"属性语义相似度: '{key}' = '{existing_value}' vs '{new_value}' = {prop_similarity:.4f}")
-                    
-                    if prop_similarity < property_similarity_threshold:
-                        return False
-                # 对于非字符串类型，仍然使用精确匹配
-                elif existing_value != new_value:
-                    logger.debug(f"非字符串属性不匹配: '{key}' = {existing_value} vs {new_value}")
-                    return False
-        
-        logger.debug(f"关系语义相似，通过验证")
-        return True
-    
-    def __calculate_text_similarity(self, text1, text2):
-        """计算两个文本的语义相似度
-        
-        Args:
-            text1: 第一个文本
-            text2: 第二个文本
-            
-        Returns:
-            float: 0-1之间的相似度分数
-        """
-        # 生成文本向量
-        vec1 = self.__generate_vector(text1)
-        vec2 = self.__generate_vector(text2)
-        
-        # 计算余弦相似度
-        similarity = self.__cosine_similarity(vec1, vec2)
-        
-        return similarity
-    
-    def __cosine_similarity(self, vec1, vec2):
-        """计算两个向量的余弦相似度
-        
-        Args:
-            vec1: 第一个向量
-            vec2: 第二个向量
-            
-        Returns:
-            float: 余弦相似度值
-        """
-        # 确保向量是numpy数组
-        vec1 = np.array(vec1)
-        vec2 = np.array(vec2)
-        
-        # 计算点积
-        dot_product = np.dot(vec1, vec2)
-        
-        # 计算向量范数
-        norm1 = np.linalg.norm(vec1)
-        norm2 = np.linalg.norm(vec2)
-        
-        # 防止除零错误
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-        
-        # 计算余弦相似度
-        similarity = dot_product / (norm1 * norm2)
-        
-        return similarity
-    
-    def __merge_relation_weights(self, session, relation_id, new_weight, properties=None):
-        """合并关系权重
-        
-        Args:
-            session: Neo4j会话
-            relation_id: 关系ID
-            new_weight: 新权重
-            properties: 要合并的额外属性
-            
-        Returns:
-            float: 更新后的权重
-        """
-        # 获取当前关系权重
-        query = """
-        MATCH ()-[r]->()
-        WHERE elementId(r) = $relation_id
-        RETURN r.weight AS current_weight, properties(r) AS props
-        """
-        
-        result = session.run(query, relation_id=relation_id)
-        record = result.single()
-        
-        if not record:
-            raise ValueError(f"关系不存在: {relation_id}")
-        
-        current_weight = record["current_weight"] if record["current_weight"] is not None else 0.0
-        current_props = record["props"]
-        
-        # 计算新权重（使用加权平均）
-        updated_weight = 0.7 * current_weight + 0.3 * new_weight
-        
-        # 确保properties是字典
-        if properties is None:
-            properties = {}
-            
-        # 更新属性
-        update_props = {"weight": updated_weight, "last_updated": datetime.now().isoformat()}
-        
-        # 合并额外属性
-        if properties:
-            for key, value in properties.items():
-                # 特别处理source_document字段，确保它不会丢失
-                if key == 'source_document':
-                    # 如果当前关系没有source_document或者需要合并多个来源
-                    if 'source_document' not in current_props:
-                        update_props[key] = value
-                    elif current_props['source_document'] != value:
-                        # 如果来源不同，可以考虑合并为列表或保留两者
-                        # 这里选择保留两者，用分号分隔
-                        current_src = current_props['source_document']
-                        update_props[key] = f"{current_src};{value}"
-                elif key not in update_props:
-                    update_props[key] = value
-        
-        # 更新关系
-        query = """
-        MATCH ()-[r]->()
-        WHERE elementId(r) = $relation_id
-        SET r = r + $update_props
-        """
-        
-        session.run(query, relation_id=relation_id, update_props=update_props)
-        return updated_weight
-    
-    def __create_new_relation(self, session, source_id, target_id, rel_type, weight, properties):
-        """创建新关系"""
-        # 确保properties是字典
-        if properties is None:
-            properties = {}
-            
-        # 确保params包含所有必要字段和属性
-        params = {
-            'source_id': source_id,
-            'target_id': target_id,
-            'weight': weight,
-            **properties
-        }
-        
-        # 构建基本查询，包含weight和last_updated
-        query = f"""
-        MATCH (source)
-        WHERE source.id = $source_id
-        MATCH (target)
-        WHERE target.id = $target_id
-        CREATE (source)-[r:{rel_type} {{weight: $weight, last_updated: datetime()}}]->(target)
-        """
-        
-        # 添加所有额外属性，特别确保source_document被正确设置
-        if properties:
-            query += "\n        SET r += $props"
-            params['props'] = properties
-        
-        query += "\n        RETURN elementId(r) AS relation_id"
-        
-        result = session.run(query, params)
-        record = result.single()
-        return record['relation_id'] if record else None
-    
-    def get_node_by_id(self, node_id):
-        """通过ID获取节点信息
-        
-        Args:
-            node_id: 节点ID
-            
-        Returns:
-            dict: 节点信息字典
-        """
-        query = """
-        MATCH (n) 
-        WHERE n.id = $node_id AND (n:Concept OR n:Entity)
-        RETURN n.id AS id, n.name AS name, n.description AS description, 
-               n.canonicalName AS canonical_name, n.aliases AS aliases,
-               n.embedding AS embedding, n.sourceDocuments AS source_documents,
-               labels(n)[0] AS type
-        """
-        
-        with self.driver.session() as session:
-            result = session.run(query, node_id=node_id)
-            record = result.single()
-            
-            if not record:
-                return None
-            
-            return {
-                "id": record["id"],
-                "name": record["name"],
-                "description": record["description"],
-                "canonical_name": record["canonical_name"],
-                "aliases": record["aliases"],
-                "embedding": record["embedding"],
-                "source_documents": record["source_documents"],
-                "type": record["type"]
-            }
-    
-    def get_concept_by_id(self, concept_id):
-        """通过ID获取概念信息（兼容旧版方法）
-        
-        Args:
-            concept_id: 概念ID
-            
-        Returns:
-            dict: 概念信息字典
-        """
-        node = self.get_node_by_id(concept_id)
-        # 如果找到节点且类型为Concept，返回节点信息
-        if node and node.get('type') == 'Concept':
-            # 移除type字段以保持向后兼容
-            node_copy = node.copy()
-            node_copy.pop('type', None)
-            return node_copy
-        return None
-        
-    def get_nodes_by_name(self, name, node_type=None, limit=10):
-        """通过名称查找节点
-        
-        Args:
-            name: 节点名称
-            node_type: 节点类型 ('Concept' 或 'Entity'，None表示两种类型都搜索)
-            limit: 返回结果数量限制
-            
-        Returns:
-            list: 节点列表
-        """
-        # 根据node_type构建节点类型条件
-        type_condition = "" if node_type is None else f"AND n:{node_type}"
-        
-        query = f"""
-        // 1. 精确匹配名称
-        MATCH (n) 
-        WHERE (n:Concept OR n:Entity) {type_condition} AND
-              (n.name = $name OR $name IN n.aliases)
-        RETURN n.id AS id, n.name AS name, n.description AS description, 
-               n.canonicalName AS canonical_name, n.aliases AS aliases,
-               n.embedding AS embedding, n.sourceDocuments AS source_documents,
-               labels(n)[0] AS type,
-               1.0 AS match_score
-        LIMIT $limit
-        
-        UNION
-        
-        // 2. 模糊匹配名称
-        MATCH (n) 
-        WHERE (n:Concept OR n:Entity) {type_condition} AND
-              (n.name CONTAINS $name OR n.canonicalName CONTAINS $name
-               OR ANY(alias IN n.aliases WHERE alias CONTAINS $name))
-        RETURN n.id AS id, n.name AS name, n.description AS description, 
-               n.canonicalName AS canonical_name, n.aliases AS aliases,
-               n.embedding AS embedding, n.sourceDocuments AS source_documents,
-               labels(n)[0] AS type,
-               0.8 AS match_score
-        LIMIT $limit
-        
-        ORDER BY match_score DESC
-        LIMIT $limit
-        """
-        
-        with self.driver.session() as session:
-            result = session.run(query, name=name, limit=limit)
-            
-            return [{
-                "id": record["id"],
-                "name": record["name"],
-                "description": record["description"],
-                "canonical_name": record["canonical_name"],
-                "aliases": record["aliases"],
-                "embedding": record["embedding"],
-                "source_documents": record["source_documents"],
-                "type": record["type"],
-                "match_score": record["match_score"]
-            } for record in result]
-    
-    def get_concepts_by_name(self, name, limit=10):
-        """通过名称查找概念（兼容旧版方法）
-        
-        Args:
-            name: 概念名称
-            limit: 返回结果数量限制
-            
-        Returns:
-            list: 概念列表
-        """
-        # 调用新方法，指定只查找Concept类型
-        nodes = self.get_nodes_by_name(name, node_type='Concept', limit=limit)
-        # 移除type字段以保持向后兼容
-        return [{k: v for k, v in node.items() if k != 'type'} for node in nodes]
-        
+    # 关系处理辅助方法已移除
+    # 现在关系创建使用直接的精确匹配逻辑，不再需要复杂的相似度计算和权重合并
+
     def get_node_statistics(self):
         """获取节点统计信息
         
@@ -1012,13 +771,13 @@ class Neo4jKnowledgeGraph:
         query = """
         // 获取Concept节点数量
         MATCH (c:Concept)
-        RETURN count(c) AS concept_count
+        RETURN count(c) AS count, 'concept' AS type
         
         UNION
         
         // 获取Entity节点数量
         MATCH (e:Entity)
-        RETURN count(e) AS entity_count
+        RETURN count(e) AS count, 'entity' AS type
         """
         
         with self.driver.session() as session:
@@ -1026,84 +785,75 @@ class Neo4jKnowledgeGraph:
             stats = {"concept_count": 0, "entity_count": 0}
             
             for record in results:
-                if "concept_count" in record:
-                    stats["concept_count"] = record["concept_count"]
-                elif "entity_count" in record:
-                    stats["entity_count"] = record["entity_count"]
+                if record["type"] == "concept":
+                    stats["concept_count"] = record["count"]
+                elif record["type"] == "entity":
+                    stats["entity_count"] = record["count"]
             
             stats["total_count"] = stats["concept_count"] + stats["entity_count"]
             return stats
     
-    def get_nodes_by_type(self, node_type, limit=100, skip=0):
-        """根据类型获取节点
+    def _normalize_document_list(self, doc_list):
+        """
+        将文档列表标准化为字典列表
         
         Args:
-            node_type: 节点类型 ('Concept' 或 'Entity')
-            limit: 返回结果数量限制
-            skip: 跳过的记录数
+            doc_list: 可能包含字符串或字典的文档列表
             
         Returns:
-            list: 节点列表
+            list: 标准化的字典列表
         """
-        if node_type not in ['Concept', 'Entity']:
-            raise ValueError("node_type必须是'Concept'或'Entity'")
-        
-        query = f"""
-        MATCH (n:{node_type})
-        RETURN n.id AS id, n.name AS name, n.description AS description, 
-               n.canonicalName AS canonical_name, n.aliases AS aliases,
-               n.embedding AS embedding, n.sourceDocuments AS source_documents,
-               labels(n)[0] AS type
-        ORDER BY n.name
-        SKIP $skip
-        LIMIT $limit
+        normalized_docs = []
+        for doc in doc_list:
+            if isinstance(doc, str):
+                try:
+                    normalized_doc = json.loads(doc)
+                    if isinstance(normalized_doc, dict):
+                        normalized_docs.append(normalized_doc)
+                    else:
+                        logger.warning(f"文档解析后不是字典格式: {normalized_doc}")
+                except json.JSONDecodeError:
+                    logger.warning(f"无法解析JSON字符串: {doc}")
+            elif isinstance(doc, dict):
+                normalized_docs.append(doc)
+            else:
+                logger.warning(f"文档类型不支持: {type(doc)}, 值: {doc}")
+        return normalized_docs
+
+    def __prepare_source_documents(self, item):
         """
-        
-        with self.driver.session() as session:
-            result = session.run(query, limit=limit, skip=skip)
-            
-            return [{
-                "id": record["id"],
-                "name": record["name"],
-                "description": record["description"],
-                "canonical_name": record["canonical_name"],
-                "aliases": record["aliases"],
-                "embedding": record["embedding"],
-                "source_documents": record["source_documents"],
-                "type": record["type"]
-            } for record in result]
-    
-    def update_node_type(self, node_id, new_type):
-        """更新节点类型
+        准备源文档列表，确保是包含文件名、标题和段落编号的字典列表
         
         Args:
-            node_id: 节点ID
-            new_type: 新的节点类型 ('Concept' 或 'Entity')
+            item: 包含source_document字段的字典
             
         Returns:
-            bool: 是否更新成功
+            list: 标准化的源文档字典列表
         """
-        if new_type not in ['Concept', 'Entity']:
-            raise ValueError("new_type必须是'Concept'或'Entity'")
+        source_documents = []
+        if "source_document" in item:
+            source_doc = item["source_document"]
+            # 如果source_doc已经是字典格式，直接添加到列表
+            if isinstance(source_doc, dict):
+                source_documents = [source_doc]
+            # 如果是列表，确保每个元素都是字典格式
+            elif isinstance(source_doc, list):
+                for doc in source_doc:
+                    if isinstance(doc, dict):
+                        source_documents.append(doc)
+                    else:
+                        # 转换为标准字典格式
+                        source_documents.append({"filename": str(doc), "title": "", "paragraph_number": None})
+            # 其他情况转换为标准字典格式
+            else:
+                source_documents = [{"filename": str(source_doc), "title": "", "paragraph_number": None}]
+        return source_documents
         
-        query = """
-        MATCH (n) 
-        WHERE n.id = $node_id AND (n:Concept OR n:Entity)
-        REMOVE n:Concept, n:Entity
-        SET n:$new_type
-        RETURN count(n) AS count
-        """
-        
-        with self.driver.session() as session:
-            result = session.run(query, node_id=node_id, new_type=new_type)
-            record = result.single()
-            return record["count"] == 1
-    
     def close(self):
         """关闭数据库连接"""
         if self.driver:
             self.driver.close()
-        logger.info("Database connection closed")
+        logger.info("数据库连接已关闭")
     
     def search_related_concepts(self, query_vector, top_k=5, threshold=0.6):
         """
@@ -1237,3 +987,132 @@ class Neo4jKnowledgeGraph:
             result['relations'] = relations
         
         return all_results[:top_k]
+    
+    def search_similar_nodes(self, start_node_id, start_node_type, max_hops, dot_threshold):
+        """
+        从指定节点开始，搜索所有至多max_hops跳相邻的同类型去重节点列表
+        
+        相邻定义：
+        1. 通过IS_ALIAS直接连接的同类节点（1跳）
+        2. 向量相似度大于dot_threshold的同类节点（1跳）
+        
+        Args:
+            start_node_id (str): 起始节点ID
+            start_node_type (str): 起始节点类型（'Concept' 或 'Entity'）
+            max_hops (int): 最大跳数限制
+            dot_threshold (float): 向量相似度的点积阈值
+            
+        Returns:
+            list: 相邻节点列表
+                [
+                    {
+                        'id': str,
+                        'name': str,
+                        'type': str,
+                        'hops': int,  # 距离起始节点的跳数
+                        'path': list  # 从起始节点到此节点的路径
+                    }
+                ]
+        """
+        results = []
+        
+        with self.driver.session() as session:
+            # 1. 验证起始节点存在并获取其信息
+            start_node_query = f"""
+            MATCH (n:{start_node_type})
+            WHERE n.id = $start_node_id
+            RETURN n.id AS id, n.name AS name, n.embedding AS embedding
+            """
+            
+            start_node_result = list(session.run(start_node_query, start_node_id=start_node_id))
+            if not start_node_result:
+                logger.warning(f"未找到节点: {start_node_type}({start_node_id})")
+                return results
+            
+            start_node = start_node_result[0]
+            start_embedding = np.array(start_node['embedding']) if start_node['embedding'] else None
+            
+            # 2. 获取所有同类型节点
+            all_nodes_query = f"""
+            MATCH (n:{start_node_type})
+            WHERE n.embedding IS NOT NULL
+            RETURN n.id AS id, n.name AS name, n.embedding AS embedding
+            """
+            
+            all_nodes = list(session.run(all_nodes_query))
+            nodes = []
+            for record in all_nodes:
+                embedding = np.array(record['embedding']) if record['embedding'] else None
+                nodes.append({
+                    'id': record['id'],
+                    'name': record['name'],
+                    'embedding': embedding
+                })
+            
+            # 3. 构建邻接表
+            adjacency = {node['id']: set() for node in nodes}
+            
+            # 3.1 添加IS_ALIAS连接的边
+            alias_query = f"""
+            MATCH (start:{start_node_type})-[:IS_ALIAS]-(end:{start_node_type})
+            WHERE start.id < end.id
+            RETURN start.id AS start_id, end.id AS end_id
+            """
+            
+            alias_results = list(session.run(alias_query))
+            for record in alias_results:
+                adjacency[record['start_id']].add(record['end_id'])
+                adjacency[record['end_id']].add(record['start_id'])
+            
+            # 3.2 添加向量相似度连接的边
+            for i in range(len(nodes)):
+                for j in range(i + 1, len(nodes)):
+                    node1 = nodes[i]
+                    node2 = nodes[j]
+                    
+                    if node1['embedding'] is not None and node2['embedding'] is not None:
+                        similarity = np.dot(node1['embedding'], node2['embedding'])
+                        if similarity > dot_threshold:
+                            adjacency[node1['id']].add(node2['id'])
+                            adjacency[node2['id']].add(node1['id'])
+            
+            # 4. 从起始节点开始进行BFS
+            visited = set()
+            queue = [(start_node_id, 0, [start_node['name']])]  # (node_id, hops, path)
+            
+            while queue:
+                current_id, hops, path = queue.pop(0)
+                
+                if current_id in visited or hops > max_hops:
+                    continue
+                
+                visited.add(current_id)
+                
+                # 跳过起始节点本身
+                if hops > 0:
+                    # 找到当前节点的信息
+                    current_node = next((n for n in nodes if n['id'] == current_id), None)
+                    if current_node:
+                        results.append({
+                            'id': current_node['id'],
+                            'name': current_node['name'],
+                            'type': start_node_type,
+                            'hops': hops,
+                            'path': path.copy()
+                        })
+                
+                # 添加邻居到队列
+                for neighbor_id in adjacency[current_id]:
+                    if neighbor_id not in visited:
+                        neighbor_node = next((n for n in nodes if n['id'] == neighbor_id), None)
+                        if neighbor_node:
+                            new_path = path.copy()
+                            new_path.append(neighbor_node['name'])
+                            queue.append((neighbor_id, hops + 1, new_path))
+            
+            # 5. 按跳数和名称排序
+            results.sort(key=lambda x: (x['hops'], x['name']))
+            
+            logger.info(f"从节点 {start_node['name']}({start_node_id[:8]}...) 找到 {len(results)} 个相邻的{start_node_type}节点")
+            
+            return results

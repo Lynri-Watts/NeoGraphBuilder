@@ -68,10 +68,8 @@ system_prompt = """
     {
     "name": "节点名称",
     "type": "Concept",  // 或 "Entity"
-    "description": "节点的详细描述",
-    "context": ["相关上下文词汇1", "相关上下文词汇2"],
-    "source_document": "来源文档标识",
-    "aliases": ["别称1", "缩写1", "别称2"]
+    "aliases": ["别称1", "缩写1", "别称2"],
+    "paragraph_number": "1.1.1"
     }
     // 更多节点...
 ],
@@ -80,50 +78,7 @@ system_prompt = """
     "source": "源节点名称",
     "target": "目标节点名称",
     "type": "关系类型",
-    "properties": {
-        "描述": "关系的详细描述"
-    }
-    }
-    // 更多关系...
-]
-}
-
-提取要求：
-1. 节点(nodes)列表应包含文本中所有重要的概念和实体
-2. 对于每个节点，请正确设置type字段：
-- "Concept"：表示抽象的概念、理论、思想、学科等非实体事物，或者实体所属的类别（如：手机、电脑、机器学习、自动社交编辑）
-- "Entity"：表示现实中唯一存在的具体事物，必须满足以下条件：
-    * 不是类别或集合
-    * 不存在歧义
-    * 能够脱离任何语境单独存在
-    * 合法实体示例：2017年、iPhone 15、微软公司、北京市
-    * 非法实体示例：本文、笔者（依赖特定语境）、9月3日、David（存在歧义）、Iphone全球使用统计（不是单一存在）
-3. 每个节点需提供name(名称)、type(类型)和description(描述)，context(上下文)和source_document(来源)为可选
-4. 每个节点必须包含aliases字段，列出该节点的所有可能别称和缩写形式，即使文章中未直接提及
-5. 无论输入为何种语言，无论原文中是否出现，请优先使用中文全称作为name字段的第一标识符
-6. 关系(relations)列表应包含节点之间的所有有意义的连接，关系类型请使用中文全称
-7. 关系必须包含source(源)、target(目标)和type(类型)，weight(权重)默认为1.0，properties(属性)为可选
-8. 请确保输出的JSON格式完全正确，可被程序直接解析。省略空格以节约Token占用
-"""
-
-system_prompt_simplified = """
-你现在的任务是从文本中提取知识图谱所需的结构化信息，包括节点(nodes)和关系(relations)。
-
-请严格按照以下JSON格式输出，不要包含任何其他内容：
-{
-"nodes": [
-    {
-    "name": "节点名称",
-    "type": "Concept",  // 或 "Entity"
-    "aliases": ["别称1", "缩写1", "别称2"]
-    }
-    // 更多节点...
-],
-"relations": [
-    {
-    "source": "源节点名称",
-    "target": "目标节点名称",
-    "type": "关系类型"
+    "paragraph_number": "1.1.1"
     }
     // 更多关系...
 ]
@@ -144,7 +99,8 @@ system_prompt_simplified = """
 5. 无论输入为何种语言，无论原文中是否出现，请优先使用中文全称作为name字段的第一标识符
 6. 关系(relations)列表应包含节点之间的所有有意义的连接，关系类型请使用中文全称
 7. 关系必须包含source(源)、target(目标)和type(类型)，weight(权重)默认为1.0
-8. 请确保输出的JSON格式完全正确，可被程序直接解析。省略空格以节约Token占用
+8. 请为每个节点和关系添加paragraph_number字段，表示其在原文中的段落编号。如果文章没有明显的段落结构，或者无法确定具体段落，可以省略此字段
+9. 请确保输出的JSON格式完全正确，可被程序直接解析。省略空格以节约Token占用
 """
 
 class Extractor:
@@ -166,19 +122,23 @@ class Extractor:
             self.logger.error(f"加载输入文件失败: {str(e)}")
             raise
 
-    def call_llm(self, text, source_document="unknown"):
+    def call_llm(self, text, source_document_info=None):
         """
         调用大模型提取概念和关系
         
         Args:
             text: 输入文本
-            source_document: 来源文档标识
+            source_document_info: 来源文档信息字典，包含filename和title
             
         Returns:
             dict: 包含concepts和relations的字典
         """
+        # 如果没有提供source_document_info，使用默认值
+        if source_document_info is None:
+            source_document_info = {"filename": "unknown", "title": "未知文档"}
+            
         # 构建完整的提示词
-        prompt = f"<systemprompt>{system_prompt_simplified}</systemprompt>\n<userinput>文本内容：{text}\n来源文档：{source_document}</userinput>"
+        prompt = f"<systemprompt>{system_prompt}</systemprompt>\n<userinput>文本内容：{text}\n来源文档：{source_document_info['filename']}\n标题：{source_document_info['title']}</userinput>"
         
         # 使用LLMClient类处理大模型调用
         return self.llm_client.call_llm(prompt)
@@ -244,20 +204,24 @@ class Extractor:
                 self.logger.error(f"备用解析方法也失败: {str(fallback_e)}")
             raise
 
-    def process_knowledge_graph(self, data, kg=None, source_document="unknown"):
+    def process_knowledge_graph(self, data, kg=None, source_document_info=None):
         """
         处理知识图谱数据并插入数据库
         
         Args:
             data: 包含nodes和relations的字典
             kg: 已初始化的Neo4jKnowledgeGraph实例（可选）
-            source_document: 来源文档标识
+            source_document_info: 来源文档信息字典，包含filename和title
             
         Returns:
             dict: 处理结果统计
         """
         local_kg = kg
         try:
+            # 如果没有提供source_document_info，使用默认值
+            if source_document_info is None:
+                source_document_info = {"filename": "unknown", "title": "未知文档"}
+            
             # 如果没有提供kg实例，则创建一个
             if local_kg is None:
                 # 初始化数据库连接
@@ -272,8 +236,17 @@ class Extractor:
             nodes = data.get('nodes', [])
             # 为每个节点添加source_document信息（如果未提供）
             for node in nodes:
+                # 构建source_document字典，包含filename、title和paragraph_number
+                doc_info = {
+                    "filename": source_document_info["filename"],
+                    "title": source_document_info["title"]
+                }
+                # 如果节点有paragraph_number字段，则添加到文档信息中
+                if 'paragraph_number' in node:
+                    doc_info["paragraph_number"] = node['paragraph_number']
+                
                 if 'source_document' not in node:
-                    node['source_document'] = source_document
+                    node['source_document'] = doc_info
                 # 确保context字段存在
                 if 'context' not in node:
                     node['context'] = []
@@ -291,8 +264,15 @@ class Extractor:
             for relation in relations:
                 if 'weight' not in relation:
                     relation['weight'] = 1.0
-                # 添加source_document字段
-                relation['source_document'] = source_document
+                # 构建source_document字典，包含filename、title和paragraph_number
+                doc_info = {
+                    "filename": source_document_info["filename"],
+                    "title": source_document_info["title"]
+                }
+                # 如果关系有paragraph_number字段，则添加到文档信息中
+                if 'paragraph_number' in relation:
+                    doc_info["paragraph_number"] = relation['paragraph_number']
+                relation['source_document'] = doc_info
             self.logger.info(f"开始插入 {len(relations)} 个关系到数据库...")
             relation_count = local_kg.insert_relations(relations)
             self.logger.info(f"成功插入 {relation_count} 个关系")
@@ -300,7 +280,7 @@ class Extractor:
             return {
                 "nodes_processed": node_count,
                 "relations_processed": relation_count,
-                "source_document": source_document
+                "source_document": source_document_info
             }
             
         except Exception as e:
@@ -326,29 +306,49 @@ class Extractor:
             dict: 处理结果统计或None
         """
         try:
+            # 初始化source_document_info
+            source_document_info = {
+                "filename": "unknown",
+                "title": "未知文档"
+            }
+            
             # 加载输入
             if input_file:
                 text = self.load_input_file(input_file)
-                # 如果没有提供source_document，则使用文件名
-                if source_document is None:
-                    source_document = os.path.basename(input_file)
+                # 获取文件的相对路径作为文档标识符
+                filename = os.path.relpath(input_file)
+                source_document_info["filename"] = filename
+                # 尝试从文件名提取标题（移除扩展名）
+                title = os.path.splitext(os.path.basename(input_file))[0]
+                # 替换下划线、连字符等为空格，美化标题
+                title = re.sub(r'[_-]+', ' ', title)
+                source_document_info["title"] = title
             else:
-                # 如果没有提供source_document且没有输入文件，则使用默认值
-                if source_document is None:
-                    source_document = "direct_input"
+                # 如果没有提供输入文件，则使用默认值
+                source_document_info["filename"] = "direct_input"
+                source_document_info["title"] = "直接输入文本"
+            
+            # 如果用户明确提供了source_document，覆盖默认值
+            if source_document:
+                if isinstance(source_document, dict):
+                    source_document_info.update(source_document)
+                else:
+                    # 保持向后兼容性
+                    source_document_info["filename"] = source_document
             
             if not text:
                 raise ValueError("必须提供输入文本或文件路径")
             
             # 调用大模型提取知识
-            kg_data = self.parse_kg_json_response(self.call_llm(text, source_document))
+            kg_data = self.parse_kg_json_response(self.call_llm(text, source_document_info))
             
             # 处理并存储到数据库
-            result = self.process_knowledge_graph(kg_data, kg, source_document)
+            result = self.process_knowledge_graph(kg_data, kg, source_document_info)
             
             # 打印最终结果
             self.logger.info("=== 知识图谱构建完成 ===")
-            self.logger.info(f"来源文档: {result['source_document']}")
+            self.logger.info(f"来源文档: {result['source_document']['filename']}")
+            self.logger.info(f"标题: {result['source_document']['title']}")
             self.logger.info(f"处理节点数: {result['nodes_processed']}")
             self.logger.info(f"处理关系数: {result['relations_processed']}")
             

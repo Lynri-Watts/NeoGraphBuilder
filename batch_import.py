@@ -16,6 +16,8 @@ import subprocess
 import multiprocessing
 import time
 import logging
+import json
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Tuple
 
@@ -38,8 +40,16 @@ def is_supported_file(file_path: str) -> bool:
     ext = os.path.splitext(file_path)[1].lower()
     return ext in SUPPORTED_EXTENSIONS
 
-def collect_files(directory: str) -> List[str]:
-    """收集目录下所有支持的文件，跳过以点开头的隐藏文件"""
+def collect_files(directory: str, limit: int = None) -> List[str]:
+    """收集目录下所有支持的文件，跳过以点开头的隐藏文件
+    
+    Args:
+        directory: 要扫描的目录路径
+        limit: 限制收集的文件数量，None表示不限制
+        
+    Returns:
+        支持的文件路径列表
+    """
     files = []
     for root, _, filenames in os.walk(directory):
         for filename in filenames:
@@ -51,7 +61,65 @@ def collect_files(directory: str) -> List[str]:
             file_path = os.path.join(root, filename)
             if is_supported_file(file_path):
                 files.append(os.path.abspath(file_path))
+                
+                # 如果设置了限制且已达到限制数量，停止收集
+                if limit is not None and len(files) >= limit:
+                    logger.info(f"已达到文件数量限制 ({limit})，停止收集更多文件")
+                    return files
+    
     return files
+
+def save_failed_files_report(failed_files: List[Tuple[str, str]], directory: str) -> str:
+    """
+    将失败的文件列表保存到reports目录中
+    
+    Args:
+        failed_files: 失败文件列表，每个元素为(文件路径, 错误信息)
+        directory: 处理的目录路径
+        
+    Returns:
+        保存的报告文件路径
+    """
+    if not failed_files:
+        return ""
+    
+    # 创建reports目录
+    reports_dir = os.path.join(os.path.dirname(__file__), "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    
+    # 生成报告文件名（包含时间戳）
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dir_name = os.path.basename(directory.rstrip(os.sep))
+    report_filename = f"failed_files_{dir_name}_{timestamp}.json"
+    report_path = os.path.join(reports_dir, report_filename)
+    
+    # 准备报告数据
+    report_data = {
+        "timestamp": datetime.now().isoformat(),
+        "processed_directory": directory,
+        "total_failed_files": len(failed_files),
+        "failed_files": [
+            {
+                "file_path": file_path,
+                "error_message": error_msg,
+                "file_name": os.path.basename(file_path),
+                "file_exists": os.path.exists(file_path)
+            }
+            for file_path, error_msg in failed_files
+        ]
+    }
+    
+    # 保存报告
+    try:
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(report_data, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"失败文件报告已保存到: {report_path}")
+        return report_path
+        
+    except Exception as e:
+        logger.error(f"保存失败文件报告时出错: {str(e)}")
+        return ""
 
 def process_file(file_path: str) -> Tuple[str, bool, str]:
     """
@@ -94,13 +162,15 @@ def process_file(file_path: str) -> Tuple[str, bool, str]:
         logger.error(f"处理文件时发生异常: {file_path}, 异常: {str(e)}")
         return (file_path, False, f"异常: {str(e)}")
 
-def batch_process(directory: str, max_workers: int = 3) -> None:
+def batch_process(directory: str, max_workers: int = 3, limit: int = None, save_report: bool = True) -> None:
     """
     批量处理目录下的所有支持的文件
     
     Args:
         directory: 要处理的目录路径
         max_workers: 最大工作进程数
+        limit: 限制处理的文件数量，None表示处理所有文件
+        save_report: 是否保存失败文件报告到reports目录
     """
     # 验证目录是否存在
     if not os.path.exists(directory):
@@ -111,14 +181,18 @@ def batch_process(directory: str, max_workers: int = 3) -> None:
         logger.error(f"指定的路径不是目录: {directory}")
         sys.exit(1)
     
-    # 收集所有支持的文件
-    files = collect_files(directory)
+    # 收集所有支持的文件（应用限制）
+    files = collect_files(directory, limit)
     
     if not files:
         logger.info(f"目录中没有找到支持的文件（{', '.join(SUPPORTED_EXTENSIONS)}）: {directory}")
         return
     
-    logger.info(f"找到 {len(files)} 个支持的文件，将使用最多 {max_workers} 个进程并行处理")
+    # 显示限制信息
+    if limit is not None:
+        logger.info(f"找到 {len(files)} 个支持的文件（限制: {limit}），将使用最多 {max_workers} 个进程并行处理")
+    else:
+        logger.info(f"找到 {len(files)} 个支持的文件，将使用最多 {max_workers} 个进程并行处理")
     
     # 统计信息
     total_files = len(files)
@@ -157,6 +231,8 @@ def batch_process(directory: str, max_workers: int = 3) -> None:
     # 输出总结
     logger.info("=== 批量处理完成 ===")
     logger.info(f"总文件数: {total_files}")
+    if limit is not None:
+        logger.info(f"文件数量限制: {limit}")
     logger.info(f"成功处理: {success_count}")
     logger.info(f"处理失败: {failure_count}")
     logger.info(f"总耗时: {total_time:.2f}秒")
@@ -165,12 +241,20 @@ def batch_process(directory: str, max_workers: int = 3) -> None:
         logger.info("\n失败的文件列表:")
         for file_path, error_msg in failed_files:
             logger.info(f"- {file_path}: {error_msg}")
+        
+        # 保存失败文件报告到reports目录
+        if save_report:
+            report_path = save_failed_files_report(failed_files, directory)
+            if report_path:
+                logger.info(f"详细失败报告已保存，可用于后续分析和重新处理")
 
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='批量导入文档到知识图谱')
     parser.add_argument('directory', help='包含文档的目录路径')
     parser.add_argument('--workers', type=int, default=3, help='并行处理的最大进程数（默认: 3）')
+    parser.add_argument('--limit', type=int, default=None, help='限制处理的文件数量（默认: 处理所有文件）')
+    parser.add_argument('--no-report', action='store_true', help='不保存失败文件报告（默认: 保存到reports目录）')
     
     args = parser.parse_args()
     
@@ -180,9 +264,12 @@ def main():
         logger.warning(f"设置的进程数({args.workers})超过了系统CPU核心数({cpu_count})，将使用CPU核心数作为最大进程数")
         args.workers = cpu_count
     
-    batch_process(args.directory, args.workers)
+    batch_process(args.directory, args.workers, args.limit, not args.no_report)
 
 if __name__ == "__main__":
     main()
 
 # python batch_import.py "documents\论文 2.0" --workers 5
+# python batch_import.py "C:\Users\Lenovo\Desktop\Knowledge Graph Generator (Test)\documents" --workers 1
+# python batch_import.py "documents" --limit 5 --workers 2  # 限制只处理5个文件，使用2个进程
+# python batch_import.py "documents" --no-report  # 不保存失败文件报告

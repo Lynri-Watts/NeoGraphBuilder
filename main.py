@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Dict, List, Tuple, Optional, Any
 import PyPDF2
-import textwrap
+import textwrap 
 
 # 导入自定义模块
 from database import Neo4jKnowledgeGraph
@@ -908,3 +908,5 @@ process_pdf_to_knowledge_graph = process_document_to_knowledge_graph
 
 if __name__ == "__main__":
     main()
+
+# python main.py "documents\2.pdf" --enable-report
