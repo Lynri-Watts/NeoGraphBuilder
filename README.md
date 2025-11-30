@@ -10,6 +10,7 @@ Knowledge Graph Generator是一个专业的知识图谱生成工具，**基于�
 - 📊 **图数据库优势**：利用Neo4j实现毫秒级复杂关系查询
 - 🔍 **智能问答系统**：基于知识图谱的RAG问答功能
 - 📁 **批量处理**：支持大规模文档的批量导入和处理
+- 📝 **文献综述生成**：基于知识图谱自动生成高质量文献综述，支持并行处理和参数优化
 
 目前该项目已具备完整的核心功能，可用于生产环境的知识图谱构建任务。我们欢迎社区贡献，包括但不限于：
 
@@ -43,6 +44,12 @@ Knowledge Graph Generator是一个专业的知识图谱生成工具，**基于�
 - **多进程并行处理**：支持大规模文档的批量导入
 - **失败报告生成**：自动生成处理失败的文件报告
 - **进度监控**：实时显示处理进度和统计信息
+
+### 📝 文献综述生成
+- **智能综述生成**：基于知识图谱自动生成高质量文献综述
+- **并行文档处理**：支持多线程并行处理文档，大幅提升效率
+- **参数优化**：可配置最大文献数和并行工作线程数
+- **Gradio界面**：提供直观的Web界面，支持任务提交和结果查看
 
 ### ⚙️ 灵活配置选项
 - **自定义参数**：支持自定义分块大小、重叠大小等参数
@@ -122,6 +129,24 @@ python batch_import.py <directory_path> --max-workers 2
 python batch_import.py <directory_path> --limit 10
 ```
 
+### 📝 文献综述生成
+
+```bash
+# 启动后端API服务
+python api.py
+
+# 启动Gradio前端界面
+python gradio_frontend.py
+```
+
+通过Gradio界面（默认地址：http://localhost:7860），您可以：
+- 输入研究主题
+- 设置是否使用LaTeX格式
+- 配置最大文献数量（max_documents）
+- 调整并行处理线程数（max_workers）
+- 提交任务并查看生成进度
+- 自动等待并获取生成结果
+
 ### 🔍 智能问答
 
 ```bash
@@ -149,14 +174,18 @@ python query.py
 ```
 ├── main.py                 # 主程序入口 - 单文档处理
 ├── batch_import.py         # 批量导入工具 - 多文档并行处理
-├── query.py               # 智能问答系统 - 基于知识图谱的RAG问答
-├── database.py            # Neo4j数据库操作 - 图数据库连接和查询
-├── extractor.py           # 知识提取器 - 大模型驱动的实体关系提取
-├── llm.py                 # 大模型客户端 - LLM API调用封装
-├── config.ini.example     # 配置文件模板 - 数据库和模型配置示例
-├── requirements.txt       # 项目依赖 - Python包列表
-├── .gitignore            # Git忽略文件
-└── README.md             # 项目文档
+├── query.py                # 智能问答系统 - 基于知识图谱的RAG问答
+├── api.py                  # 后端API服务 - 文献综述生成API接口
+├── gradio_frontend.py      # Gradio前端界面 - 文献综述生成Web界面
+├── literature_review_generator.py # 文献综述生成器 - 核心综述生成逻辑
+├── document_manager.py     # 文档管理器 - 处理文献读取和概括
+├── database.py             # Neo4j数据库操作 - 图数据库连接和查询
+├── extractor.py            # 知识提取器 - 大模型驱动的实体关系提取
+├── llm.py                  # 大模型客户端 - LLM API调用封装
+├── config.ini.example      # 配置文件模板 - 数据库和模型配置示例
+├── requirements.txt        # 项目依赖 - Python包列表
+├── .gitignore              # Git忽略文件
+└── README.md               # 项目文档
 ```
 
 ## 输出结果
@@ -242,6 +271,8 @@ similar_nodes = kg.search_similar_nodes(
 2. **模型调用超时**：可调整LLM配置中的超时参数
 3. **内存不足**：减少并行进程数或分块大小
 4. **连接失败**：检查配置文件中的数据库和模型连接参数
+5. **前端无法连接后端**：确保API服务正在运行，且端口配置正确
+6. **并行处理性能问题**：根据系统性能调整max_workers参数，避免资源过载
 
 ### 🔧 性能优化
 - **并行处理**：根据CPU核心数调整批量处理的并行进程数

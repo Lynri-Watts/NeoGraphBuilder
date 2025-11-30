@@ -335,7 +335,27 @@ def process_document_to_knowledge_graph(file_path: str, chunk_size: int = CHUNK_
         
         # 第一步：对整篇文章进行完整提取
         logger.info("=== 第一步：对整篇文章进行完整提取 ===")
-        source_document = f"{os.path.basename(file_path)}"
+        # 在main.py中处理source_document信息，使用相对路径
+        # 获取相对于项目根目录的相对路径
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        if os.path.isabs(file_path):
+            # 如果是绝对路径，转换为相对路径
+            try:
+                rel_path = os.path.relpath(file_path, project_root)
+            except ValueError:
+                # 如果无法转换为相对路径，使用原始路径
+                rel_path = file_path
+        else:
+            # 如果已经是相对路径，直接使用
+            rel_path = file_path
+        
+        filename = rel_path  # 使用相对路径而不是仅文件名
+        title = os.path.splitext(os.path.basename(file_path))[0]  # title仍使用文件名
+        title = re.sub(r'[_-]+', ' ', title)
+        source_document = {
+            "filename": filename,  # 存储相对路径
+            "title": title
+        }
         
         retry_count = 0
         success = False
@@ -402,8 +422,11 @@ def process_document_to_knowledge_graph(file_path: str, chunk_size: int = CHUNK_
                 chunk_id = i + 1
                 logger.info(f"处理块 {chunk_id}/{len(chunks)} (字符位置: {start_pos}-{end_pos})")
                 
-                # 生成块标识符
-                source_document = f"{os.path.basename(file_path)}_chunk_{chunk_id}"
+                # 生成块标识符，使用相对路径
+                source_document = {
+                    "filename": f"{rel_path}_chunk_{chunk_id}",  # 使用相对路径
+                    "title": f"{title}_chunk_{chunk_id}"
+                }
                 
                 # 尝试处理块（带重试）
                 retry_count = 0
@@ -653,8 +676,16 @@ def generate_knowledge_graph_report(kg: Neo4jKnowledgeGraph, summary: Dict, file
     report_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reports')
     os.makedirs(report_dir, exist_ok=True)
     
+    # 获取文件的相对路径用于报告
+    # 获取项目根目录（main.py所在目录）
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    if os.path.isabs(file_path):
+        rel_path = os.path.relpath(file_path, project_root)
+    else:
+        rel_path = file_path
+    
     report_data = {
-        'file': os.path.basename(file_path),
+        'file': rel_path,  # 使用相对路径
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
         'summary': summary,
         'stats': kg.stats
@@ -670,7 +701,7 @@ def generate_knowledge_graph_report(kg: Neo4jKnowledgeGraph, summary: Dict, file
     
     try:
         # 生成可视化图表
-        generate_visualizations(kg.stats, summary, report_dir, os.path.basename(pdf_path))
+        generate_visualizations(kg.stats, summary, report_dir, os.path.basename(file_path))
     except Exception as e:
         logger.error(f"生成可视化时出错: {str(e)}")
 

@@ -164,6 +164,9 @@ class Neo4jKnowledgeGraph:
     
     def __generate_vector(self, text):
         """为文本生成嵌入向量，采用逐个编码方式以获得更准确的向量表示"""
+        import time
+        start_time = time.time()
+        
         # 确保文本是字符串类型
         if not isinstance(text, str) or not text.strip():
             logger.warning(f"无效文本输入: {text}")
@@ -171,8 +174,18 @@ class Neo4jKnowledgeGraph:
             return [0.0] * self.model.get_sentence_embedding_dimension()
             
         try:
+            # 记录编码前的详细信息
+            text_length = len(text)
+            text_preview = text[:100] + "..." if text_length > 100 else text
+            logger.info(f"[SENTENCE_TRANSFORMER] 开始编码文本 - 长度: {text_length}, 预览: '{text_preview}'")
+            
             # 逐一生成向量，确保更准确的编码
+            encode_start = time.time()
             vector = self.model.encode(text, convert_to_numpy=True)
+            encode_time = time.time() - encode_start
+            
+            # 记录编码后的信息
+            logger.info(f"[SENTENCE_TRANSFORMER] 编码完成 - 耗时: {encode_time:.3f}s, 向量维度: {vector.shape if hasattr(vector, 'shape') else len(vector)}")
             
             # 验证向量是否有效
             if vector is None or len(vector) == 0:
@@ -183,11 +196,15 @@ class Neo4jKnowledgeGraph:
             if np.isnan(vector).any():
                 logger.warning(f"生成的向量包含NaN值: {text}")
                 return [0.0] * self.model.get_sentence_embedding_dimension()
+            
+            total_time = time.time() - start_time
+            logger.info(f"[SENTENCE_TRANSFORMER] __generate_vector完成 - 总耗时: {total_time:.3f}s")
                 
             return vector.tolist()
             
         except Exception as e:
-            logger.error(f"生成向量时出错: {text} - {str(e)}")
+            error_time = time.time() - start_time
+            logger.error(f"[SENTENCE_TRANSFORMER] 生成向量时出错 - 耗时: {error_time:.3f}s, 文本: '{text[:50]}...', 错误: {str(e)}")
             return [0.0] * self.model.get_sentence_embedding_dimension()
     
     def __find_similar_nodes(self, node):
@@ -873,7 +890,7 @@ class Neo4jKnowledgeGraph:
             YIELD node AS n, score AS similarity
             WHERE similarity > $threshold
             RETURN n.id AS id, n.name AS name, n.description AS description, 
-                   n.canonicalName AS canonical_name, similarity
+                   n.canonicalName AS canonical_name, n.sourceDocuments AS sourceDocuments, similarity
             ORDER BY similarity DESC
             """
             results = list(session.run(query, vector=query_vector.tolist(), 
@@ -884,6 +901,7 @@ class Neo4jKnowledgeGraph:
                 'name': record['name'],
                 'description': record['description'],
                 'canonical_name': record['canonical_name'],
+                'source_documents': record['sourceDocuments'],
                 'similarity': record['similarity']
             } for record in results]
     
@@ -905,7 +923,7 @@ class Neo4jKnowledgeGraph:
             YIELD node AS n, score AS similarity
             WHERE similarity > $threshold
             RETURN n.id AS id, n.name AS name, n.description AS description, 
-                   n.canonicalName AS canonical_name, similarity
+                   n.canonicalName AS canonical_name, n.sourceDocuments AS sourceDocuments, similarity
             ORDER BY similarity DESC
             """
             results = list(session.run(query, vector=query_vector.tolist(), 
@@ -916,6 +934,7 @@ class Neo4jKnowledgeGraph:
                 'name': record['name'],
                 'description': record['description'],
                 'canonical_name': record['canonical_name'],
+                'source_documents': record['sourceDocuments'],
                 'similarity': record['similarity']
             } for record in results]
     
@@ -950,47 +969,180 @@ class Neo4jKnowledgeGraph:
                 'related_node_type': record['related_node_type']
             } for record in results]
     
-    def search_knowledge_by_text(self, query_text, top_k=5):
+    def search_knowledge_by_text(self, query_text, top_k=5, max_hops=2, dot_threshold=0.95):
         """
-        基于文本搜索相关知识
+        基于文本搜索相关知识，并在找到最近节点后搜索相似节点
         
         Args:
             query_text: 查询文本
             top_k: 返回的最大结果数
+            max_hops: 搜索相似节点的最大跳数
+            dot_threshold: 向量相似度的点积阈值
             
         Returns:
-            组合的相关知识列表
+            组合的相关知识列表，包含相似节点信息
         """
-        # 获取查询向量
-        query_vector = self.model.encode(query_text)
+        import time
+        start_time = time.time()
         
-        # 搜索相关概念和实体
-        concepts = self.search_related_concepts(query_vector, top_k)
-        entities = self.search_related_entities(query_vector, top_k)
+        # 记录查询开始
+        query_length = len(query_text)
+        query_preview = query_text[:100] + "..." if query_length > 100 else query_text
+        logger.info(f"[SENTENCE_TRANSFORMER] search_knowledge_by_text开始 - 查询长度: {query_length}, 预览: '{query_preview}', top_k: {top_k}")
         
-        # 合并结果并按相似度排序
-        all_results = []
-        for concept in concepts:
-            concept['node_type'] = 'Concept'
-            all_results.append(concept)
-        
-        for entity in entities:
-            entity['node_type'] = 'Entity'
-            all_results.append(entity)
-        
-        # 按相似度排序
-        all_results.sort(key=lambda x: x['similarity'], reverse=True)
-        
-        # 为每个结果添加关系信息
-        for result in all_results[:top_k]:
-            relations = self.get_node_relations(result['id'], result['node_type'])
-            result['relations'] = relations
-        
-        return all_results[:top_k]
+        try:
+            # 获取查询向量
+            encode_start = time.time()
+            query_vector = self.model.encode(query_text)
+            encode_time = time.time() - encode_start
+            logger.info(f"[SENTENCE_TRANSFORMER] 查询向量编码完成 - 耗时: {encode_time:.3f}s, 向量维度: {query_vector.shape if hasattr(query_vector, 'shape') else len(query_vector)}")
+            
+            # 搜索相关概念和实体
+            search_start = time.time()
+            concepts = self.search_related_concepts(query_vector, top_k)
+            entities = self.search_related_entities(query_vector, top_k)
+            search_time = time.time() - search_start
+            logger.info(f"[SENTENCE_TRANSFORMER] 概念和实体搜索完成 - 耗时: {search_time:.3f}s, 找到概念: {len(concepts)}, 实体: {len(entities)}")
+            
+            # 合并结果并按相似度排序
+            all_results = []
+            for concept in concepts:
+                concept['node_type'] = 'Concept'
+                all_results.append(concept)
+            
+            for entity in entities:
+                entity['node_type'] = 'Entity'
+                all_results.append(entity)
+            
+            # 按相似度排序
+            all_results.sort(key=lambda x: x['similarity'], reverse=True)
+            
+            # 为每个结果添加关系信息和相似节点
+            for i, result in enumerate(all_results[:top_k]):
+                logger.info(f"[SENTENCE_TRANSFORMER] 处理第{i+1}/{min(top_k, len(all_results))}个结果 - 节点: {result.get('name', 'Unknown')}")
+                
+                relations_start = time.time()
+                relations = self.get_node_relations(result['id'], result['node_type'])
+                relations_time = time.time() - relations_start
+                logger.info(f"[SENTENCE_TRANSFORMER] 获取关系信息完成 - 耗时: {relations_time:.3f}s, 关系数: {len(relations)}")
+                result['relations'] = relations
+                
+                # 调用search_similar_nodes寻找其他相似节点
+                similar_start = time.time()
+                similar_nodes = self.search_similar_nodes(
+                    start_node_id=result['id'],
+                    start_node_type=result['node_type'],
+                    max_hops=max_hops,
+                    dot_threshold=dot_threshold
+                )
+                similar_time = time.time() - similar_start
+                logger.info(f"[SENTENCE_TRANSFORMER] 搜索相似节点完成 - 耗时: {similar_time:.3f}s, 相似节点数: {len(similar_nodes)}")
+                result['similar_nodes'] = similar_nodes
+            
+            total_time = time.time() - start_time
+            logger.info(f"[SENTENCE_TRANSFORMER] search_knowledge_by_text完成 - 总耗时: {total_time:.3f}s, 返回结果数: {len(all_results[:top_k])}")
+            
+            return all_results[:top_k]
+            
+        except Exception as e:
+            error_time = time.time() - start_time
+            logger.error(f"[SENTENCE_TRANSFORMER] search_knowledge_by_text出错 - 耗时: {error_time:.3f}s, 查询: '{query_text[:50]}...', 错误: {str(e)}")
+            return []
     
+    def _find_adjacent_nodes(self, node_id, node_type, dot_threshold, session):
+        """
+        查找指定节点的所有相邻节点
+        
+        Args:
+            node_id (str): 节点ID
+            node_type (str): 节点类型
+            dot_threshold (float): 向量相似度阈值
+            session: Neo4j会话
+            
+        Returns:
+            list: 相邻节点列表
+        """
+        logger.info(f"[SENTENCE_TRANSFORMER] 查找节点 {node_id[:8]}... 的相邻节点")
+        
+        try:
+            # 1. 尝试使用APOC插件查找向量相似节点，如果失败则使用替代方案
+            try:
+                similar_nodes_query = f"""
+                MATCH (start:{node_type} {{id: $node_id}})
+                MATCH (other:{node_type})
+                WHERE other.id <> start.id 
+                  AND other.embedding IS NOT NULL
+                  AND start.embedding IS NOT NULL
+                WITH start, other, 
+                     apoc.math.cosineSimilarity(start.embedding, other.embedding) AS similarity
+                WHERE similarity > $dot_threshold
+                RETURN other.id AS id, other.name AS name, similarity
+                ORDER BY similarity DESC
+                """
+                
+                similar_results = list(session.run(similar_nodes_query, 
+                                                  node_id=node_id, 
+                                                  dot_threshold=dot_threshold))
+                logger.info(f"[SENTENCE_TRANSFORMER] 使用APOC插件找到 {len(similar_results)} 个相似节点")
+                
+            except Exception as apoc_error:
+                logger.warning(f"[SENTENCE_TRANSFORMER] APOC插件不可用，使用替代方案: {str(apoc_error)}")
+                
+                # 使用reduce函数计算余弦相似度的替代方案
+                similar_nodes_query = f"""
+                MATCH (start:{node_type} {{id: $node_id}})
+                MATCH (other:{node_type})
+                WHERE other.id <> start.id 
+                  AND other.embedding IS NOT NULL
+                  AND start.embedding IS NOT NULL
+                WITH start, other, start.embedding AS start_vec, other.embedding AS other_vec
+                WITH start, other,
+                     reduce(dot = 0.0, i IN range(0, size(start_vec)-1) | dot + start_vec[i] * other_vec[i]) AS dot_product,
+                     reduce(sq1 = 0.0, i IN range(0, size(start_vec)-1) | sq1 + start_vec[i] * start_vec[i]) AS start_norm_sq,
+                     reduce(sq2 = 0.0, i IN range(0, size(other_vec)-1) | sq2 + other_vec[i] * other_vec[i]) AS other_norm_sq
+                WITH start, other, 
+                     CASE WHEN start_norm_sq > 0 AND other_norm_sq > 0
+                          THEN dot_product / (sqrt(start_norm_sq) * sqrt(other_norm_sq))
+                          ELSE 0.0
+                     END AS similarity
+                WHERE similarity > $dot_threshold
+                RETURN other.id AS id, other.name AS name, similarity
+                ORDER BY similarity DESC
+                """
+                
+                similar_results = list(session.run(similar_nodes_query, 
+                                                  node_id=node_id, 
+                                                  dot_threshold=dot_threshold))
+                logger.info(f"[SENTENCE_TRANSFORMER] 使用替代方案找到 {len(similar_results)} 个相似节点")
+            
+            # 2. 查找IS_ALIAS连接的节点
+            alias_query = f"""
+            MATCH (start:{node_type} {{id: $node_id}})-[:IS_ALIAS]-(alias:{node_type})
+            RETURN alias.id AS id, alias.name AS name, 1.0 AS similarity
+            """
+            
+            alias_results = list(session.run(alias_query, node_id=node_id))
+            logger.info(f"[SENTENCE_TRANSFORMER] 找到 {len(alias_results)} 个IS_ALIAS节点")
+            
+            # 3. 合并结果
+            adjacent_nodes = []
+            for record in similar_results + alias_results:
+                adjacent_nodes.append({
+                    'id': record['id'],
+                    'name': record['name'],
+                    'similarity': record['similarity']
+                })
+            
+            logger.info(f"[SENTENCE_TRANSFORMER] 节点 {node_id[:8]}... 总共找到 {len(adjacent_nodes)} 个相邻节点")
+            return adjacent_nodes
+            
+        except Exception as e:
+            logger.error(f"[SENTENCE_TRANSFORMER] 查找相邻节点时发生错误: {str(e)}")
+            return []
+
     def search_similar_nodes(self, start_node_id, start_node_type, max_hops, dot_threshold):
         """
-        从指定节点开始，搜索所有至多max_hops跳相邻的同类型去重节点列表
+        从指定节点开始，使用BFS搜索所有至多max_hops跳相邻的同类型节点列表
         
         相邻定义：
         1. 通过IS_ALIAS直接连接的同类节点（1跳）
@@ -1016,12 +1168,14 @@ class Neo4jKnowledgeGraph:
         """
         results = []
         
+        logger.info(f"[SENTENCE_TRANSFORMER] 开始BFS搜索相似节点 - 起始节点: {start_node_type}({start_node_id}), 最大跳数: {max_hops}, 点积阈值: {dot_threshold}")
+        
         with self.driver.session() as session:
-            # 1. 验证起始节点存在并获取其信息
+            # 1. 验证起始节点存在
             start_node_query = f"""
             MATCH (n:{start_node_type})
             WHERE n.id = $start_node_id
-            RETURN n.id AS id, n.name AS name, n.embedding AS embedding
+            RETURN n.id AS id, n.name AS name
             """
             
             start_node_result = list(session.run(start_node_query, start_node_id=start_node_id))
@@ -1030,69 +1184,32 @@ class Neo4jKnowledgeGraph:
                 return results
             
             start_node = start_node_result[0]
-            start_embedding = np.array(start_node['embedding']) if start_node['embedding'] else None
             
-            # 2. 获取所有同类型节点
-            all_nodes_query = f"""
-            MATCH (n:{start_node_type})
-            WHERE n.embedding IS NOT NULL
-            RETURN n.id AS id, n.name AS name, n.embedding AS embedding
-            """
-            
-            all_nodes = list(session.run(all_nodes_query))
-            nodes = []
-            for record in all_nodes:
-                embedding = np.array(record['embedding']) if record['embedding'] else None
-                nodes.append({
-                    'id': record['id'],
-                    'name': record['name'],
-                    'embedding': embedding
-                })
-            
-            # 3. 构建邻接表
-            adjacency = {node['id']: set() for node in nodes}
-            
-            # 3.1 添加IS_ALIAS连接的边
-            alias_query = f"""
-            MATCH (start:{start_node_type})-[:IS_ALIAS]-(end:{start_node_type})
-            WHERE start.id < end.id
-            RETURN start.id AS start_id, end.id AS end_id
-            """
-            
-            alias_results = list(session.run(alias_query))
-            for record in alias_results:
-                adjacency[record['start_id']].add(record['end_id'])
-                adjacency[record['end_id']].add(record['start_id'])
-            
-            # 3.2 添加向量相似度连接的边
-            for i in range(len(nodes)):
-                for j in range(i + 1, len(nodes)):
-                    node1 = nodes[i]
-                    node2 = nodes[j]
-                    
-                    if node1['embedding'] is not None and node2['embedding'] is not None:
-                        similarity = np.dot(node1['embedding'], node2['embedding'])
-                        if similarity > dot_threshold:
-                            adjacency[node1['id']].add(node2['id'])
-                            adjacency[node2['id']].add(node1['id'])
-            
-            # 4. 从起始节点开始进行BFS
+            # 2. BFS搜索
             visited = set()
             queue = [(start_node_id, 0, [start_node['name']])]  # (node_id, hops, path)
             
-            while queue:
+            while queue and len(results) < 100:  # 限制结果数量避免过多
                 current_id, hops, path = queue.pop(0)
                 
                 if current_id in visited or hops > max_hops:
                     continue
                 
                 visited.add(current_id)
+                logger.info(f"[SENTENCE_TRANSFORMER] BFS处理节点: {current_id[:8]}..., 跳数: {hops}, 已访问: {len(visited)}")
                 
                 # 跳过起始节点本身
                 if hops > 0:
-                    # 找到当前节点的信息
-                    current_node = next((n for n in nodes if n['id'] == current_id), None)
-                    if current_node:
+                    # 获取当前节点信息
+                    current_node_query = f"""
+                    MATCH (n:{start_node_type})
+                    WHERE n.id = $node_id
+                    RETURN n.id AS id, n.name AS name
+                    """
+                    
+                    current_node_result = list(session.run(current_node_query, node_id=current_id))
+                    if current_node_result:
+                        current_node = current_node_result[0]
                         results.append({
                             'id': current_node['id'],
                             'name': current_node['name'],
@@ -1101,18 +1218,24 @@ class Neo4jKnowledgeGraph:
                             'path': path.copy()
                         })
                 
-                # 添加邻居到队列
-                for neighbor_id in adjacency[current_id]:
-                    if neighbor_id not in visited:
-                        neighbor_node = next((n for n in nodes if n['id'] == neighbor_id), None)
-                        if neighbor_node:
-                            new_path = path.copy()
-                            new_path.append(neighbor_node['name'])
-                            queue.append((neighbor_id, hops + 1, new_path))
+                # 如果还没达到最大跳数，查找相邻节点并加入队列
+                if hops < max_hops:
+                    try:
+                        adjacent_nodes = self._find_adjacent_nodes(current_id, start_node_type, dot_threshold, session)
+                        
+                        for neighbor in adjacent_nodes:
+                            if neighbor['id'] not in visited:
+                                new_path = path.copy()
+                                new_path.append(neighbor['name'])
+                                queue.append((neighbor['id'], hops + 1, new_path))
+                                
+                    except Exception as e:
+                        logger.error(f"[SENTENCE_TRANSFORMER] 查找节点 {current_id[:8]}... 的相邻节点时出错: {str(e)}")
+                        continue
             
-            # 5. 按跳数和名称排序
+            # 3. 按跳数和名称排序
             results.sort(key=lambda x: (x['hops'], x['name']))
             
-            logger.info(f"从节点 {start_node['name']}({start_node_id[:8]}...) 找到 {len(results)} 个相邻的{start_node_type}节点")
+            logger.info(f"[SENTENCE_TRANSFORMER] BFS搜索完成 - 从节点 {start_node['name']}({start_node_id[:8]}...) 找到 {len(results)} 个相邻的{start_node_type}节点")
             
             return results

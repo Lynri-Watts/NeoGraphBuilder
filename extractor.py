@@ -14,12 +14,12 @@ import os
 import json
 import logging
 import time
-import configparser
 import re
 from llm import LLMClient
 
 # 导入数据库模块
 from database import Neo4jKnowledgeGraph
+import PyPDF2
 
 # 配置日志
 if not logging.getLogger().handlers:
@@ -27,30 +27,10 @@ if not logging.getLogger().handlers:
 logger = logging.getLogger(__name__)
 
 # 从配置文件读取配置
+import configparser
 config = configparser.ConfigParser()
 config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
 config.read(config_path)
-
-# 大模型配置
-LLM_CONFIG = {
-    "base_url": config.get('LLM_CONFIG', 'base_url'),
-    "api_key": config.get('LLM_CONFIG', 'api_key'),
-    "model": config.get('LLM_CONFIG', 'model')
-}
-
-# 大模型额外配置 - 作为整体读取所有配置项
-LLM_EXTRA_CONFIG = {}
-if 'LLM_EXTRA_CONFIG' in config:
-    for key, value in config.items('LLM_EXTRA_CONFIG'):
-        # 特殊处理布尔值配置项
-        if key == 'should_remove_conversation':
-            LLM_EXTRA_CONFIG[key] = config.getboolean('LLM_EXTRA_CONFIG', key)
-        else:
-            # 对于普通配置项，直接添加
-            LLM_EXTRA_CONFIG[key] = value
-    logger.debug(f"加载的LLM_EXTRA_CONFIG: {LLM_EXTRA_CONFIG}")
-else:
-    logger.warning("配置文件中未找到LLM_EXTRA_CONFIG部分")
 
 # 数据库配置
 NEO4J_CONFIG = {
@@ -109,18 +89,102 @@ class Extractor:
     def __init__(self):
         """初始化提取器"""
         self.logger = logging.getLogger(__name__)
-        self.llm_client = LLMClient(LLM_CONFIG, LLM_EXTRA_CONFIG)
+        # 使用llm.py的配置读取功能
+        self.llm_client = LLMClient()
+
+    def extract_pdf_title(self, pdf_path: str) -> str:
+        """
+        从PDF文件中提取标题
+        
+        Args:
+            pdf_path: PDF文件路径
+            
+        Returns:
+            str: 提取的标题，如果无法提取则返回文件名
+        """
+        try:
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                
+                # 首先尝试从PDF元数据中获取标题
+                if reader.metadata and reader.metadata.title:
+                    title = reader.metadata.title.strip()
+                    if title and title != "Untitled":
+                        self.logger.info(f"从PDF元数据中提取到标题: {title}")
+                        return title
+                
+                # 如果元数据中没有标题，尝试从第一页文本中提取
+                if len(reader.pages) > 0:
+                    first_page = reader.pages[0]
+                    first_page_text = first_page.extract_text()
+                    
+                    if first_page_text:
+                        # 尝试从第一页文本中提取标题
+                        lines = first_page_text.split('\n')
+                        
+                        # 寻找可能的标题行（通常在文档开头，长度适中，不包含页码）
+                        for i, line in enumerate(lines[:10]):  # 只检查前10行
+                            line = line.strip()
+                            
+                            # 跳过空行、页码行、过短的行
+                            if (len(line) < 5 or 
+                                line.isdigit() or 
+                                re.match(r'^\d+\s*$', line) or
+                                re.match(r'.*第\s*\d+\s*页.*', line) or
+                                re.match(r'.*Page\s*\d+.*', line, re.IGNORECASE)):
+                                continue
+                            
+                            # 跳过可能包含期刊信息的行
+                            if any(keyword in line.lower() for keyword in [
+                                'journal', 'vol.', 'issue', 'doi:', 'issn', 'isbn',
+                                'abstract', 'keywords', 'introduction'
+                            ]):
+                                continue
+                            
+                            # 如果这一行看起来像标题（长度适中，不全是数字或特殊字符）
+                            if (10 <= len(line) <= 200 and 
+                                not re.match(r'^[^\w\u4e00-\u9fff]+$', line) and
+                                not line.count(' ') > len(line) * 0.3):  # 不超过30%是空格
+                                
+                                self.logger.info(f"从第一页文本中提取到标题: {line}")
+                                return line
+                        
+                        # 如果没有找到合适的标题，尝试使用前几行的组合
+                        title_lines = []
+                        for line in lines[:5]:
+                            line = line.strip()
+                            if (len(line) > 5 and 
+                                not line.isdigit() and
+                                not re.match(r'.*第\s*\d+\s*页.*', line) and
+                                not re.match(r'.*Page\s*\d+.*', line, re.IGNORECASE)):
+                                title_lines.append(line)
+                        
+                        if title_lines:
+                            combined_title = ' '.join(title_lines[:2])  # 最多取前两行
+                            if len(combined_title) <= 200:
+                                self.logger.info(f"从第一页前几行组合提取到标题: {combined_title}")
+                                return combined_title
+                
+                # 如果所有方法都失败，使用文件名
+                filename = os.path.splitext(os.path.basename(pdf_path))[0]
+                title = re.sub(r'[_-]+', ' ', filename)
+                self.logger.warning(f"无法从PDF内容中提取标题，使用文件名: {title}")
+                return title
+                
+        except Exception as e:
+            self.logger.error(f"提取PDF标题时出错: {str(e)}")
+            # 出错时使用文件名
+            filename = os.path.splitext(os.path.basename(pdf_path))[0]
+            title = re.sub(r'[_-]+', ' ', filename)
+            return title
 
     def load_input_file(self, file_path):
-        """从文件加载输入文本"""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            self.logger.info(f"成功加载输入文件: {file_path}")
-            return content
-        except Exception as e:
-            self.logger.error(f"加载输入文件失败: {str(e)}")
-            raise
+        """
+        加载输入文件内容（已弃用，现在由main.py处理文件读取）
+        """
+        # 这个方法现在不应该被调用，因为main.py已经读取了文件内容
+        # 如果被调用，说明代码逻辑有问题
+        raise NotImplementedError("load_input_file方法已弃用，文件读取应由main.py处理")
 
     def call_llm(self, text, source_document_info=None):
         """
@@ -292,15 +356,14 @@ class Extractor:
                 local_kg.close()
                 self.logger.info("数据库连接已关闭")
 
-    def process(self, input_file=None, text=None, kg=None, source_document=None):
+    def process(self, text, kg=None, source_document=None):
         """
         处理知识图谱构建的主方法
         
         Args:
-            input_file: 输入文件路径
-            text: 直接输入文本（如果不使用文件）
+            text: 输入文本（必需）
             kg: 已初始化的Neo4jKnowledgeGraph实例（可选）
-            source_document: 来源文档标识（可选，如果不提供则自动确定）
+            source_document: 来源文档信息字典（可选）
             
         Returns:
             dict: 处理结果统计或None
@@ -312,33 +375,20 @@ class Extractor:
                 "title": "未知文档"
             }
             
-            # 加载输入
-            if input_file:
-                text = self.load_input_file(input_file)
-                # 获取文件的相对路径作为文档标识符
-                filename = os.path.relpath(input_file)
-                source_document_info["filename"] = filename
-                # 尝试从文件名提取标题（移除扩展名）
-                title = os.path.splitext(os.path.basename(input_file))[0]
-                # 替换下划线、连字符等为空格，美化标题
-                title = re.sub(r'[_-]+', ' ', title)
-                source_document_info["title"] = title
-            else:
-                # 如果没有提供输入文件，则使用默认值
-                source_document_info["filename"] = "direct_input"
-                source_document_info["title"] = "直接输入文本"
-            
-            # 如果用户明确提供了source_document，覆盖默认值
+            # 如果用户提供了source_document，使用它
             if source_document:
                 if isinstance(source_document, dict):
-                    source_document_info.update(source_document)
+                    source_document_info = source_document
                 else:
                     # 保持向后兼容性
                     source_document_info["filename"] = source_document
             
             if not text:
-                raise ValueError("必须提供输入文本或文件路径")
+                raise ValueError("必须提供输入文本")
             
+            with open("test_log.txt", 'w', encoding='utf-8') as f:
+                f.write(text)
+
             # 调用大模型提取知识
             kg_data = self.parse_kg_json_response(self.call_llm(text, source_document_info))
             
@@ -366,7 +416,7 @@ def main(input_file=None, text=None, kg=None):
     主函数 - 知识图谱构建工作流（向后兼容）
     
     Args:
-        input_file: 输入文件路径
+        input_file: 输入文件路径（已弃用，仅用于向后兼容）
         text: 直接输入文本（如果不使用文件）
         kg: 已初始化的Neo4jKnowledgeGraph实例（可选）
         
@@ -374,9 +424,30 @@ def main(input_file=None, text=None, kg=None):
         dict: 处理结果统计或None
     """
     extractor = Extractor()
-    return extractor.process(input_file, text, kg)
+    
+    # 向后兼容：如果提供了input_file但没有提供text，尝试读取文件
+    if input_file and not text:
+        import os
+        try:
+            with open(input_file, 'r', encoding='utf-8') as f:
+                text = f.read()
+            logger.warning(f"为了向后兼容，从文件 {input_file} 读取了文本内容")
+        except Exception as e:
+            logger.error(f"向后兼容模式：无法读取文件 {input_file}: {str(e)}")
+            return None
+    
+    if not text:
+        logger.error("必须提供输入文本")
+        return None
+    
+    return extractor.process(text=text, kg=kg)
 
 if __name__ == "__main__":
     # 示例用法
-    # 从文件处理
+    # 从文件处理（向后兼容）
     main(input_file="userinput_半结构化文本.txt")
+    
+    # 或者直接处理文本（推荐的新用法）
+    # with open("userinput_半结构化文本.txt", 'r', encoding='utf-8') as f:
+    #     text = f.read()
+    # main(text=text)

@@ -269,7 +269,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-# python batch_import.py "documents\论文 2.0" --workers 5
+# python batch_import.py "documents\论文 2.0" --workers 10
 # python batch_import.py "C:\Users\Lenovo\Desktop\Knowledge Graph Generator (Test)\documents" --workers 1
 # python batch_import.py "documents" --limit 5 --workers 2  # 限制只处理5个文件，使用2个进程
 # python batch_import.py "documents" --no-report  # 不保存失败文件报告
