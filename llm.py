@@ -79,13 +79,14 @@ class LLMClient:
             api_key=self.config.get('api_key')
         )
     
-    def call_llm(self, prompt: str, model_type: str = "reasoner") -> str:
+    def call_llm(self, prompt: str, model_type: str = "reasoner", system_prompt: Optional[str] = None) -> str:
         """
         唯一的开放接口，调用大模型获取流式响应并解析
         
         Args:
-            prompt: 完整的提示词内容
+            prompt: 用户提示词内容
             model_type: 模型类型，可选值为 "reasoner" 或 "chat"
+            system_prompt: 系统提示词内容
             
         Returns:
             大模型回答的内容字符串
@@ -100,10 +101,16 @@ class LLMClient:
             else:  # 默认使用reasoner
                 model = self.config.get("model_reasoner", self.config.get("model"))
             
+            # 构建消息列表
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            
             # 调用大模型获取流式响应
             response = self.client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 stream=True,
                 extra_body=self.extra_config
             )

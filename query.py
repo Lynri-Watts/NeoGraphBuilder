@@ -40,18 +40,20 @@ NEO4J_CONFIG = {
     "password": config.get('NEO4J_CONFIG', 'password')
 }
 
-# RAG提示词模板
-RAG_PROMPT_TEMPLATE = """
+# RAG系统提示词模板
+RAG_SYSTEM_PROMPT = """
 你是一个基于知识图谱的问答助手。请根据以下提供的相关信息，回答用户的问题。回答问题时，应当将相关信息与用户问题结合，考虑到信息的准确性和完整性。
-同时，当你的回答涉及到知识图谱中的知识时，应当用通顺的语句复述这些知识，因为用户一般不能直接看到知识图谱的具体结构和关系。
+同时，当你的回答涉及到知识图谱中的知识时，应当用通顺的语句复述这些知识，因为用户一般不能直接看到知识图谱的具体结构和关系。避免出现“节点”“关系”“路径”等直接由知识图谱元素组成的语句。
+请使用中文回答，确保回答准确、全面、简洁。如果信息不足，请明确表示无法回答相关部分，并基于已知信息尽可能提供帮助。
+"""
 
+# RAG用户提示词模板
+RAG_USER_PROMPT_TEMPLATE = """
 相关信息：
 {context}
 
 用户问题：
 {query}
-
-请使用中文回答，确保回答准确、全面、简洁。如果信息不足，请明确表示无法回答相关部分，并基于已知信息尽可能提供帮助。
 """
 
 class KnowledgeGraphQA:
@@ -308,11 +310,11 @@ class KnowledgeGraphQA:
         """
         logger.info("调用大模型生成回答...")
         
-        # 构建提示词
-        prompt = RAG_PROMPT_TEMPLATE.format(context=context, query=query)
+        # 构建用户提示词
+        user_prompt = RAG_USER_PROMPT_TEMPLATE.format(context=context, query=query)
         
         # 使用LLMClient生成回答
-        answer = self.llm_client.call_llm(prompt)
+        answer = self.llm_client.call_llm(user_prompt, system_prompt=RAG_SYSTEM_PROMPT)
         
         return answer
     

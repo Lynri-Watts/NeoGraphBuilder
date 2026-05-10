@@ -21,20 +21,31 @@ class Neo4jKnowledgeGraph:
         # 使用本地缓存加载多语言模型，更好地支持人名、缩写和不常见概念
         model_name = 'paraphrase-multilingual-MiniLM-L12-v2'
         
-        # 先检查本地是否存在模型
-        try:
-            # 尝试只从本地加载模型
+        # 直接使用本地路径加载模型，避免网络检查
+        model_path = os.path.join(model_cache_dir, 
+                                 'models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2',
+                                 'snapshots',
+                                 '86741b4e3f5cb7765a600d3a3d55a0f6a6cb443d')
+        
+        if os.path.exists(model_path):
+            logger.info(f"使用本地模型路径: {model_path}")
+            try:
+                # 直接从本地路径加载，完全避免网络连接
+                self.model = SentenceTransformer(model_path)
+                logger.info(f"成功从本地路径加载模型")
+            except Exception as e:
+                logger.error(f"从本地路径加载模型失败: {str(e)}")
+                # 回退到标准加载方式
+                logger.info("尝试标准加载方式...")
+                self.model = SentenceTransformer(model_name, 
+                                              cache_folder=model_cache_dir)
+                logger.info(f"模型加载完成")
+        else:
+            logger.warning(f"本地模型路径不存在: {model_path}")
+            # 使用标准加载方式
             self.model = SentenceTransformer(model_name, 
-                                          cache_folder=model_cache_dir,
-                                          local_files_only=True)
-            logger.info(f"成功从本地加载模型: {model_name}")
-        except (OSError, FileNotFoundError):
-            # 如果本地不存在，则从网络下载
-            logger.info(f"本地模型不存在，开始从网络下载: {model_name}")
-            self.model = SentenceTransformer(model_name, 
-                                          cache_folder=model_cache_dir,
-                                          local_files_only=False)
-            logger.info(f"模型下载完成: {model_name}")
+                                          cache_folder=model_cache_dir)
+            logger.info(f"模型加载完成")
         
         # 检查并加载Spacy模型
         spacy_model = "en_core_web_sm"

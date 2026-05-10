@@ -20,6 +20,8 @@ from llm import LLMClient
 # 导入数据库模块
 from database import Neo4jKnowledgeGraph
 import PyPDF2
+import pandas as pd
+import numpy as np
 
 # 配置日志
 if not logging.getLogger().handlers:
@@ -86,97 +88,15 @@ system_prompt = """
 class Extractor:
     """知识图谱提取器类"""
     
-    def __init__(self):
+    def __init__(self, label=None):
         """初始化提取器"""
         self.logger = logging.getLogger(__name__)
         # 使用llm.py的配置读取功能
         self.llm_client = LLMClient()
-
-    def extract_pdf_title(self, pdf_path: str) -> str:
-        """
-        从PDF文件中提取标题
-        
-        Args:
-            pdf_path: PDF文件路径
-            
-        Returns:
-            str: 提取的标题，如果无法提取则返回文件名
-        """
-        try:
-            with open(pdf_path, 'rb') as file:
-                reader = PyPDF2.PdfReader(file)
-                
-                # 首先尝试从PDF元数据中获取标题
-                if reader.metadata and reader.metadata.title:
-                    title = reader.metadata.title.strip()
-                    if title and title != "Untitled":
-                        self.logger.info(f"从PDF元数据中提取到标题: {title}")
-                        return title
-                
-                # 如果元数据中没有标题，尝试从第一页文本中提取
-                if len(reader.pages) > 0:
-                    first_page = reader.pages[0]
-                    first_page_text = first_page.extract_text()
-                    
-                    if first_page_text:
-                        # 尝试从第一页文本中提取标题
-                        lines = first_page_text.split('\n')
-                        
-                        # 寻找可能的标题行（通常在文档开头，长度适中，不包含页码）
-                        for i, line in enumerate(lines[:10]):  # 只检查前10行
-                            line = line.strip()
-                            
-                            # 跳过空行、页码行、过短的行
-                            if (len(line) < 5 or 
-                                line.isdigit() or 
-                                re.match(r'^\d+\s*$', line) or
-                                re.match(r'.*第\s*\d+\s*页.*', line) or
-                                re.match(r'.*Page\s*\d+.*', line, re.IGNORECASE)):
-                                continue
-                            
-                            # 跳过可能包含期刊信息的行
-                            if any(keyword in line.lower() for keyword in [
-                                'journal', 'vol.', 'issue', 'doi:', 'issn', 'isbn',
-                                'abstract', 'keywords', 'introduction'
-                            ]):
-                                continue
-                            
-                            # 如果这一行看起来像标题（长度适中，不全是数字或特殊字符）
-                            if (10 <= len(line) <= 200 and 
-                                not re.match(r'^[^\w\u4e00-\u9fff]+$', line) and
-                                not line.count(' ') > len(line) * 0.3):  # 不超过30%是空格
-                                
-                                self.logger.info(f"从第一页文本中提取到标题: {line}")
-                                return line
-                        
-                        # 如果没有找到合适的标题，尝试使用前几行的组合
-                        title_lines = []
-                        for line in lines[:5]:
-                            line = line.strip()
-                            if (len(line) > 5 and 
-                                not line.isdigit() and
-                                not re.match(r'.*第\s*\d+\s*页.*', line) and
-                                not re.match(r'.*Page\s*\d+.*', line, re.IGNORECASE)):
-                                title_lines.append(line)
-                        
-                        if title_lines:
-                            combined_title = ' '.join(title_lines[:2])  # 最多取前两行
-                            if len(combined_title) <= 200:
-                                self.logger.info(f"从第一页前几行组合提取到标题: {combined_title}")
-                                return combined_title
-                
-                # 如果所有方法都失败，使用文件名
-                filename = os.path.splitext(os.path.basename(pdf_path))[0]
-                title = re.sub(r'[_-]+', ' ', filename)
-                self.logger.warning(f"无法从PDF内容中提取标题，使用文件名: {title}")
-                return title
-                
-        except Exception as e:
-            self.logger.error(f"提取PDF标题时出错: {str(e)}")
-            # 出错时使用文件名
-            filename = os.path.splitext(os.path.basename(pdf_path))[0]
-            title = re.sub(r'[_-]+', ' ', filename)
-            return title
+        # 加载元数据
+        self.metadata_df = None
+        if label:
+            self.load_metadata(label)
 
     def load_input_file(self, file_path):
         """
@@ -186,6 +106,110 @@ class Extractor:
         # 如果被调用，说明代码逻辑有问题
         raise NotImplementedError("load_input_file方法已弃用，文件读取应由main.py处理")
 
+    def load_metadata(self, label_path):
+        """
+        加载Excel文件中的论文元数据
+        
+        Args:
+            label_path: Excel文件路径
+        """
+        try:
+            self.metadata_df = pd.read_excel(label_path)
+            # 清理数据
+            self.metadata_df = self.metadata_df[['作者', '标题', 'PDF标题', '期刊', '刊号页码']]
+            # 移除重复行
+            self.metadata_df = self.metadata_df.drop_duplicates(subset=['PDF标题'])
+            # 重置索引
+            self.metadata_df = self.metadata_df.reset_index(drop=True)
+            self.logger.info(f"成功加载 {len(self.metadata_df)} 条论文元数据")
+        except Exception as e:
+            self.logger.error(f"加载元数据失败: {str(e)}")
+            self.metadata_df = None
+    
+    def find_longest_common_substring(self, s1, s2):
+        """
+        查找两个字符串之间的最长公共子串，忽略标点符号
+        
+        Args:
+            s1: 第一个字符串
+            s2: 第二个字符串
+            
+        Returns:
+            str: 最长公共子串
+        """
+        import string
+        
+        if not s1 or not s2:
+            return ""
+        
+        # 移除标点符号
+        translator = str.maketrans('', '', string.punctuation)
+        s1_clean = s1.translate(translator)
+        s2_clean = s2.translate(translator)
+        
+        # 计算最长公共子串长度矩阵
+        m, n = len(s1_clean), len(s2_clean)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        max_len = 0
+        end_pos = 0
+        
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if s1_clean[i-1] == s2_clean[j-1]:
+                    dp[i][j] = dp[i-1][j-1] + 1
+                    if dp[i][j] > max_len:
+                        max_len = dp[i][j]
+                        end_pos = i
+        
+        return s1_clean[end_pos - max_len:end_pos]
+    
+    def get_document_metadata(self, filename):
+        """
+        根据文件名匹配获取对应的论文元数据
+        
+        Args:
+            filename: 输入文件名
+            
+        Returns:
+            dict: 匹配到的论文元数据
+        """
+        if self.metadata_df is None or self.metadata_df.empty:
+            return None
+        
+        # 从文件名中提取标题部分（去除扩展名）
+        file_title = os.path.splitext(os.path.basename(filename))[0]
+        
+        # 初始化最佳匹配
+        best_match = None
+        max_similarity = 0
+        
+        # 遍历所有元数据记录
+        for index, row in self.metadata_df.iterrows():
+            if pd.isna(row['PDF标题']):
+                continue
+            
+            # 计算最长公共子串长度作为相似度指标
+            common_substr = self.find_longest_common_substring(file_title, row['PDF标题'])
+            similarity = len(common_substr) / max(len(file_title), len(row['PDF标题']))
+            
+            # 更新最佳匹配
+            if similarity > max_similarity:
+                max_similarity = similarity
+                best_match = {
+                    'author': row['作者'] if not pd.isna(row['作者']) else None,
+                    'title': row['标题'] if not pd.isna(row['标题']) else None,
+                    'journal': row['期刊'] if not pd.isna(row['期刊']) else None,
+                    'issue_page': row['刊号页码'] if not pd.isna(row['刊号页码']) else None
+                }
+        
+        # 只有当相似度足够高时才返回匹配结果
+        if max_similarity > 0.3:
+            self.logger.info(f"文件名 '{filename}' 匹配到论文: {best_match['title']} (相似度: {max_similarity:.2f})")
+            return best_match
+        else:
+            self.logger.warning(f"文件名 '{filename}' 未找到匹配的论文元数据 (最高相似度: {max_similarity:.2f})")
+            return None
+    
     def call_llm(self, text, source_document_info=None):
         """
         调用大模型提取概念和关系
@@ -201,11 +225,11 @@ class Extractor:
         if source_document_info is None:
             source_document_info = {"filename": "unknown", "title": "未知文档"}
             
-        # 构建完整的提示词
-        prompt = f"<systemprompt>{system_prompt}</systemprompt>\n<userinput>文本内容：{text}\n来源文档：{source_document_info['filename']}\n标题：{source_document_info['title']}</userinput>"
+        # 构建用户提示词
+        prompt = f"文本内容：{text}\n来源文档：{source_document_info['filename']}\n标题：{source_document_info['title']}"
         
-        # 使用LLMClient类处理大模型调用
-        return self.llm_client.call_llm(prompt)
+        # 使用LLMClient类处理大模型调用，将system_prompt作为单独参数传递
+        return self.llm_client.call_llm(prompt, system_prompt=system_prompt)
 
     def parse_kg_json_response(self, answer_str: str) -> dict[str, any]:
         """
@@ -300,11 +324,18 @@ class Extractor:
             nodes = data.get('nodes', [])
             # 为每个节点添加source_document信息（如果未提供）
             for node in nodes:
-                # 构建source_document字典，包含filename、title和paragraph_number
+                # 构建source_document字典，包含filename、title、author、journal、issue_page和paragraph_number
                 doc_info = {
                     "filename": source_document_info["filename"],
                     "title": source_document_info["title"]
                 }
+                # 添加元数据字段（如果存在）
+                if 'author' in source_document_info:
+                    doc_info["author"] = source_document_info["author"]
+                if 'journal' in source_document_info:
+                    doc_info["journal"] = source_document_info["journal"]
+                if 'issue_page' in source_document_info:
+                    doc_info["issue_page"] = source_document_info["issue_page"]
                 # 如果节点有paragraph_number字段，则添加到文档信息中
                 if 'paragraph_number' in node:
                     doc_info["paragraph_number"] = node['paragraph_number']
@@ -328,11 +359,18 @@ class Extractor:
             for relation in relations:
                 if 'weight' not in relation:
                     relation['weight'] = 1.0
-                # 构建source_document字典，包含filename、title和paragraph_number
+                # 构建source_document字典，包含filename、title、author、journal、issue_page和paragraph_number
                 doc_info = {
                     "filename": source_document_info["filename"],
                     "title": source_document_info["title"]
                 }
+                # 添加元数据字段（如果存在）
+                if 'author' in source_document_info:
+                    doc_info["author"] = source_document_info["author"]
+                if 'journal' in source_document_info:
+                    doc_info["journal"] = source_document_info["journal"]
+                if 'issue_page' in source_document_info:
+                    doc_info["issue_page"] = source_document_info["issue_page"]
                 # 如果关系有paragraph_number字段，则添加到文档信息中
                 if 'paragraph_number' in relation:
                     doc_info["paragraph_number"] = relation['paragraph_number']
@@ -383,6 +421,19 @@ class Extractor:
                     # 保持向后兼容性
                     source_document_info["filename"] = source_document
             
+            # 获取文件名
+            filename = source_document_info["filename"]
+            
+            # 尝试获取文档元数据
+            metadata = self.get_document_metadata(filename)
+            if metadata:
+                # 更新标题为元数据中的标题
+                source_document_info["title"] = metadata["title"]
+                # 添加其他元数据
+                source_document_info["author"] = metadata["author"]
+                source_document_info["journal"] = metadata["journal"]
+                source_document_info["issue_page"] = metadata["issue_page"]
+            
             if not text:
                 raise ValueError("必须提供输入文本")
             
@@ -406,12 +457,14 @@ class Extractor:
             
         except Exception as e:
             self.logger.error(f"工作流执行失败: {str(e)}")
+            import traceback
+            self.logger.error(f"详细错误信息:\n{traceback.format_exc()}")
             return None
 
 # 为了保持向后兼容性，保留原有的main函数
 # 但现在它会使用Extractor类
 
-def main(input_file=None, text=None, kg=None):
+def main(input_file=None, text=None, kg=None, label=None):
     """
     主函数 - 知识图谱构建工作流（向后兼容）
     
@@ -419,19 +472,27 @@ def main(input_file=None, text=None, kg=None):
         input_file: 输入文件路径（已弃用，仅用于向后兼容）
         text: 直接输入文本（如果不使用文件）
         kg: 已初始化的Neo4jKnowledgeGraph实例（可选）
+        label: 元数据Excel文件路径（可选）
         
     Returns:
         dict: 处理结果统计或None
     """
-    extractor = Extractor()
+    extractor = Extractor(label=label)
     
     # 向后兼容：如果提供了input_file但没有提供text，尝试读取文件
     if input_file and not text:
         import os
         try:
-            with open(input_file, 'r', encoding='utf-8') as f:
-                text = f.read()
-            logger.warning(f"为了向后兼容，从文件 {input_file} 读取了文本内容")
+            # 检查文件扩展名，如果是PDF则使用专门的PDF读取函数
+            if input_file.lower().endswith('.pdf'):
+                from main import read_pdf
+                text = read_pdf(input_file)
+                logger.warning(f"为了向后兼容，从PDF文件 {input_file} 提取了文本内容")
+            else:
+                # 对于文本文件，使用UTF-8编码读取
+                with open(input_file, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                logger.warning(f"为了向后兼容，从文本文件 {input_file} 读取了文本内容")
         except Exception as e:
             logger.error(f"向后兼容模式：无法读取文件 {input_file}: {str(e)}")
             return None
@@ -445,7 +506,7 @@ def main(input_file=None, text=None, kg=None):
 if __name__ == "__main__":
     # 示例用法
     # 从文件处理（向后兼容）
-    main(input_file="userinput_半结构化文本.txt")
+    main(input_file="documents\\1.pdf")
     
     # 或者直接处理文本（推荐的新用法）
     # with open("userinput_半结构化文本.txt", 'r', encoding='utf-8') as f:

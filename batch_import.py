@@ -7,6 +7,7 @@
 1. 遍历指定目录下的所有PDF文件
 2. 使用多进程并行处理文档
 3. 调用main.py将每个文档导入知识图谱
+4. 支持指定论文元数据Excel文件（索引文件）
 """
 
 import os
@@ -121,12 +122,13 @@ def save_failed_files_report(failed_files: List[Tuple[str, str]], directory: str
         logger.error(f"保存失败文件报告时出错: {str(e)}")
         return ""
 
-def process_file(file_path: str) -> Tuple[str, bool, str]:
+def process_file(file_path: str, label: str = None) -> Tuple[str, bool, str]:
     """
     处理单个文件
     
     Args:
         file_path: 文件路径
+        label: 论文元数据Excel文件路径（索引文件）
         
     Returns:
         Tuple[str, bool, str]: (文件路径, 是否成功, 错误信息或空字符串)
@@ -141,6 +143,10 @@ def process_file(file_path: str) -> Tuple[str, bool, str]:
             os.path.join(os.path.dirname(__file__), "main.py"),
             file_path
         ]
+        
+        # 如果提供了索引文件，添加--label参数
+        if label:
+            cmd.extend(["--label", label])
         
         # 执行命令
         result = subprocess.run(
@@ -162,7 +168,7 @@ def process_file(file_path: str) -> Tuple[str, bool, str]:
         logger.error(f"处理文件时发生异常: {file_path}, 异常: {str(e)}")
         return (file_path, False, f"异常: {str(e)}")
 
-def batch_process(directory: str, max_workers: int = 3, limit: int = None, save_report: bool = True) -> None:
+def batch_process(directory: str, max_workers: int = 3, limit: int = None, save_report: bool = True, label: str = None) -> None:
     """
     批量处理目录下的所有支持的文件
     
@@ -171,6 +177,7 @@ def batch_process(directory: str, max_workers: int = 3, limit: int = None, save_
         max_workers: 最大工作进程数
         limit: 限制处理的文件数量，None表示处理所有文件
         save_report: 是否保存失败文件报告到reports目录
+        label: 论文元数据Excel文件路径（索引文件）
     """
     # 验证目录是否存在
     if not os.path.exists(directory):
@@ -205,7 +212,7 @@ def batch_process(directory: str, max_workers: int = 3, limit: int = None, save_
     # 使用进程池并行处理
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
-        future_to_file = {executor.submit(process_file, file_path): file_path for file_path in files}
+        future_to_file = {executor.submit(process_file, file_path, label): file_path for file_path in files}
         
         # 等待任务完成并处理结果
         for i, future in enumerate(as_completed(future_to_file), 1):
@@ -255,6 +262,7 @@ def main():
     parser.add_argument('--workers', type=int, default=3, help='并行处理的最大进程数（默认: 3）')
     parser.add_argument('--limit', type=int, default=None, help='限制处理的文件数量（默认: 处理所有文件）')
     parser.add_argument('--no-report', action='store_true', help='不保存失败文件报告（默认: 保存到reports目录）')
+    parser.add_argument('--label', help='论文元数据Excel文件路径（索引文件）')
     
     args = parser.parse_args()
     
@@ -264,7 +272,7 @@ def main():
         logger.warning(f"设置的进程数({args.workers})超过了系统CPU核心数({cpu_count})，将使用CPU核心数作为最大进程数")
         args.workers = cpu_count
     
-    batch_process(args.directory, args.workers, args.limit, not args.no_report)
+    batch_process(args.directory, args.workers, args.limit, not args.no_report, args.label)
 
 if __name__ == "__main__":
     main()
@@ -273,3 +281,5 @@ if __name__ == "__main__":
 # python batch_import.py "C:\Users\Lenovo\Desktop\Knowledge Graph Generator (Test)\documents" --workers 1
 # python batch_import.py "documents" --limit 5 --workers 2  # 限制只处理5个文件，使用2个进程
 # python batch_import.py "documents" --no-report  # 不保存失败文件报告
+# python batch_import.py "documents\labeled_documents\documents" --label "documents\labeled_documents\label.xlsx" --workers 10
+# python batch_import.py "documents" --limit 1 --workers 1

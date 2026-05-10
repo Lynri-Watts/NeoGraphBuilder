@@ -441,8 +441,11 @@ class SearchAgent:
 已搜索过的关键词：{', '.join(search_history)}
 
 已访问的节点数量：{len(self.visited_nodes)}
-
-请分析当前搜索状态，并建议下一步应该搜索的关键词。要求：
+"""
+        
+        try:
+            # 构建提示词
+            system_prompt = """请分析当前搜索状态，并建议下一步应该搜索的关键词。要求：
 1. 基于当前路径中的节点关系和描述，推荐3-5个相关关键词
 2. 避免重复已搜索过的关键词
 3. 关键词应该有助于扩展研究路径，覆盖主题的不同方面
@@ -451,12 +454,9 @@ class SearchAgent:
 请以JSON格式返回关键词列表，例如：
 ["关键词1", "关键词2", "关键词3"]
 
-你的输出仅包含这个列表，不要输出任何其他提示性语句
-"""
-        
-        try:
+你的输出仅包含这个列表，不要输出任何其他提示性语句"""
             # 调用大模型获取搜索建议
-            response = self.llm_client.call_llm(current_state, model_type="chat")
+            response = self.llm_client.call_llm(current_state, model_type="chat", system_prompt=system_prompt)
             
             # 尝试解析JSON响应
             import json
@@ -560,9 +560,9 @@ class SearchAgent:
         # 使用大模型智能推荐文献
         try:
             # 构建文献推荐提示
-            prompt = f"""
-请根据研究主题从以下文献列表中推荐重要的{max_docs}篇文献：
-
+            system_prompt = f"请根据研究主题从以下文献列表中推荐重要的{max_docs}篇文献。请基于与研究主题的相关性、文献质量、重要性等因素进行推荐。请以JSON格式返回推荐文献的索引列表，例如：[1, 3, 5]。你的输出仅包含这个列表，不要输出任何其他内容。"
+            
+            user_prompt = f"""
 研究主题：{topic}
 节点名称：{node['name']}
 节点类型：{node.get('node_type', 'Unknown')}
@@ -573,17 +573,10 @@ class SearchAgent:
             for i, doc in enumerate(documents, 1):
                 title = doc.get('title', '未知标题')
                 filename = doc.get('filename', '未知文件')
-                prompt += f"{i}. 标题: {title}\n   文件: {filename}\n"
-            
-            prompt += f"""
-请基于与研究主题的相关性、文献质量、重要性等因素，推荐重要的{max_docs}篇文献。
-请以JSON格式返回推荐文献的索引列表，例如：
-[1, 3, 5]
-
-推荐文献索引："""
+                user_prompt += f"{i}. 标题: {title}\n   文件: {filename}\n"
             
             # 调用大模型获取推荐
-            response = self.llm_client.call_llm(prompt, model_type="chat")
+            response = self.llm_client.call_llm(user_prompt, model_type="chat", system_prompt=system_prompt)
             
             # 解析推荐结果
             import json
@@ -1510,22 +1503,21 @@ class DocumentReaderAgent:
             # 获取文献信息
             title = doc_info.get('title', '未知标题')
             filename = doc_info.get('filename', '未知文件')
-            authors = doc_info.get('authors', [])
+            author = doc_info.get('author', '')  # 新增的作者字段
             year = doc_info.get('year', '')
-            journal = doc_info.get('journal', '')
-            volume = doc_info.get('volume', '')
-            pages = doc_info.get('pages', '')
+            journal = doc_info.get('journal', '')  # 新增的期刊字段
+            issue_page = doc_info.get('issue_page', '')  # 新增的期刊页码字段
             doi = doc_info.get('doi', '')
             
             # 生成作者字符串
-            if authors:
-                if isinstance(authors, list):
-                    if len(authors) <= 3:
-                        author_str = ', '.join(authors)
+            if author:
+                if isinstance(author, list):
+                    if len(author) <= 3:
+                        author_str = ', '.join(author)
                     else:
-                        author_str = ', '.join(authors[:3]) + ', et al.'
+                        author_str = ', '.join(author[:3]) + ', et al.'
                 else:
-                    author_str = str(authors)
+                    author_str = str(author)
             else:
                 # 如果没有作者信息，从文件名提取
                 author_str = self._extract_author_from_filename(filename)
@@ -1544,10 +1536,8 @@ class DocumentReaderAgent:
             
             if journal:
                 journal_part = journal
-                if volume:
-                    journal_part += f", {volume}"
-                if pages:
-                    journal_part += f", {pages}"
+                if issue_page:  # 使用新增的期刊页码字段
+                    journal_part += f", {issue_page}"
                 citation_parts.append(f"*{journal_part}*")
             
             if doi:
@@ -1632,25 +1622,18 @@ class DocumentReaderAgent:
                 document_text = document_text[:max_content_length] + "...[内容已截断]"
             
             # 构建更简洁的主题感知概括提示
-            prompt = f"""
-请根据研究主题对以下文档进行概括：
-
+            system_prompt = "你是一个专业的学术文献综述撰写专家。请根据研究主题对文档进行概括，提供简洁的学术概括（200-300字），重点突出：1. 与研究主题的相关性 2. 核心观点和贡献 3. 理论或实践价值 4. 重要概念和方法。"
+            user_prompt = f"""
 研究主题：{topic}
 文档标题：{title}
 
 文档内容：
 {document_text}
 
-请提供简洁的学术概括（200-300字），重点突出：
-1. 与研究主题的相关性
-2. 核心观点和贡献
-3. 理论或实践价值
-4. 重要概念和方法
-
 概括："""
             
             # 调用大模型生成概括（每篇文档单独调用）
-            response = self.llm_client.call_llm(prompt, model_type="chat")
+            response = self.llm_client.call_llm(user_prompt, model_type="chat", system_prompt=system_prompt)
             
             # 清理和验证响应
             summary = response.strip()
@@ -1680,33 +1663,28 @@ class DocumentReaderAgent:
         """
         try:
             # 构建节点概括提示
-            prompt = f"""
-请基于以下多个文档的概括，为研究主题创建一个综合性的节点概括：
+            system_prompt = """请基于以下多个文档的概括，为研究主题创建一个综合性的节点概括。请创建一个综合概括，包括：
+1. 这些文档共同为研究主题提供了什么视角
+2. 该节点在研究主题中的核心作用
+3. 主要的理论框架和实践方法
+4. 与其他研究方向的关联性
 
+请以简洁、学术的语调进行概括，字数控制在200-300字之间。"""
+            
+            user_prompt = f"""
 研究主题：{topic}
 
 相关文档概括：
 """
             
             for i, doc_sum in enumerate(document_summaries, 1):
-                prompt += f"""
+                user_prompt += f"""
 文档 {i}: {doc_sum['title']}
 概括: {doc_sum['topic_aware_summary']}
 """
             
-            prompt += """
-
-请创建一个综合概括，包括：
-1. 这些文档共同为研究主题提供了什么视角
-2. 该节点在研究主题中的核心作用
-3. 主要的理论框架和实践方法
-4. 与其他研究方向的关联性
-
-请以简洁、学术的语调进行概括，字数控制在200-300字之间。
-"""
-            
             # 调用大模型生成节点概括
-            response = self.llm_client.call_llm(prompt, model_type="chat")
+            response = self.llm_client.call_llm(user_prompt, model_type="chat", system_prompt=system_prompt)
             
             # 清理响应
             summary = response.strip()
@@ -1865,16 +1843,7 @@ class GeneratorAgent:
             bibliography = self._generate_latex_bibliography(citations)
             
             # 构建LaTeX文献综述生成提示词
-            prompt = f"""
-你是一个专业的学术文献综述撰写专家，精通LaTeX格式。请基于以下知识图谱中检索到的研究路径和相关文献，为指定主题撰写一篇高质量的LaTeX格式文献综述。
-
-研究主题：{topic}
-
-检索到的研究路径和文献信息：
-{search_context}
-
-请按照以下LaTeX格式结构撰写文献综述：
-
+            system_prompt = """你是一个专业的学术文献综述撰写专家，精通LaTeX格式。请基于以下知识图谱中检索到的研究路径和相关文献，为指定主题撰写一篇高质量的LaTeX格式文献综述。请按照以下LaTeX格式结构撰写文献综述：
 ```latex
 \\documentclass[a4paper,12pt]{{article}}
 \\usepackage[utf8]{{inputenc}}
@@ -1935,12 +1904,19 @@ class GeneratorAgent:
 - 体现批判性思维和学术深度
 - 确保LaTeX语法正确，可以直接编译
 - 使用自然通顺的语句引用检索到的信息，避免直接出现路径或节点
+- 给定的文献可能重复，应当合并引用，避免重复引用
+            
+            """
+            user_prompt = f"""
+研究主题：{topic}
 
-请生成完整的LaTeX文献综述代码：
+检索到的研究路径和文献信息：
+{search_context}
+
 """
             
             # 调用大模型生成LaTeX文献综述
-            response = self.llm_client.call_llm(prompt)
+            response = self.llm_client.call_llm(user_prompt, system_prompt=system_prompt)
             
             # 清理和验证LaTeX代码
             latex_code = self._clean_latex_code(response)
@@ -2020,13 +1996,10 @@ class GeneratorAgent:
                 return self.generate_literature_review_latex(topic, search_context)
             else:
                 # 构建文献综述生成提示词
-                prompt = f"""
-你是一个专业的学术文献综述撰写专家。请基于以下知识图谱中检索到的研究路径和相关文献，为指定主题撰写一篇高质量的文献综述。
+                system_prompt = f"""
+你是一个专业的学术文献综述撰写专家。
 
-研究主题：{topic}
-
-检索到的研究路径和文献信息：
-{search_context}
+请基于以下知识图谱中检索到的研究路径和相关文献，为指定主题撰写一篇高质量的文献综述。
 
 请按照以下结构撰写文献综述：
 
@@ -2066,9 +2039,15 @@ class GeneratorAgent:
 
 请开始撰写文献综述：
 """
+                user_prompt = f"""
+研究主题：{topic}
+
+检索到的研究路径和文献信息：
+{search_context}
+"""
             
                 # 调用大模型生成文献综述
-                review = self.llm_client.call_llm(prompt)
+                review = self.llm_client.call_llm(user_prompt, system_prompt=system_prompt)
                 
                 logger.info("文献综述生成完成")
                 

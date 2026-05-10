@@ -149,12 +149,26 @@ python gradio_frontend.py
 
 ### 🔍 智能问答
 
+**交互式命令行界面**
 ```bash
 # 启动交互式问答系统
 python query.py
 
 # 程序会提示输入问题，然后基于知识图谱生成回答
 ```
+
+**Web界面（Gradio）**
+```bash
+# 启动知识图谱问答Web界面
+python query_gradio.py
+```
+
+通过Gradio界面（默认地址：http://localhost:7860），您可以：
+- 初始化知识图谱问答系统
+- 设置检索相关信息的数量
+- 输入问题并获取回答
+- 查看系统状态和提示信息
+- 使用快捷键提交问题
 
 ### ⚙️ 参数说明
 

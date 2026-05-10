@@ -286,7 +286,7 @@ def split_text_with_overlap(text: str, chunk_size: int, overlap_size: int) -> Li
     logger.info(f"文本已分成 {len(chunks)} 个块，每个块约 {chunk_size} 字符，重叠 {overlap_size} 字符")
     return chunks
 
-def process_document_to_knowledge_graph(file_path: str, chunk_size: int = CHUNK_SIZE, overlap_size: int = OVERLAP_SIZE, disable_report: bool = True, disable_chunking: bool = True) -> dict:
+def process_document_to_knowledge_graph(file_path: str, chunk_size: int = CHUNK_SIZE, overlap_size: int = OVERLAP_SIZE, disable_report: bool = True, disable_chunking: bool = True, label: Optional[str] = None) -> dict:
     """
     处理文献（仅支持PDF）并构建知识图谱
     
@@ -369,7 +369,7 @@ def process_document_to_knowledge_graph(file_path: str, chunk_size: int = CHUNK_
                 before_relations = kg.stats['relations']['new_relations']
                 
                 # 调用Extractor类处理整篇文章，传入kg实例和source_document
-                extractor = Extractor()
+                extractor = Extractor(label=label)
                 full_document_result = extractor.process(text=text, kg=kg, source_document=source_document)
                 
                 if full_document_result:
@@ -913,6 +913,7 @@ def main():
     parser.add_argument('--overlap-size', type=int, default=OVERLAP_SIZE, help=f'块之间的重叠字符数 (默认: {OVERLAP_SIZE})')
     parser.add_argument('--enable-report', action='store_true', help='启用报告和可视化生成（默认禁用）')
     parser.add_argument('--enable-chunking', action='store_true', help='启用分块处理（默认禁用）')
+    parser.add_argument('--label', help='论文元数据Excel文件路径')
     
     args = parser.parse_args()
     
@@ -923,7 +924,7 @@ def main():
         
         # 根据命令行参数决定是否禁用报告和是否启用分块处理
         # 注意：disable_chunking参数与enable-chunking命令行参数相反
-        process_document_to_knowledge_graph(args.file_path, args.chunk_size, args.overlap_size, not args.enable_report, not args.enable_chunking)
+        process_document_to_knowledge_graph(args.file_path, args.chunk_size, args.overlap_size, not args.enable_report, not args.enable_chunking, label=args.label)
         
         end_time = time.time()
         logger.info(f"文件处理完成，总耗时: {(end_time - start_time):.2f} 秒")

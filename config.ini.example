@@ -1,12 +1,13 @@
 [LLM_CONFIG]
 base_url = http://localhost:8001/v1
 api_key = your_api_key_here
-model = deepseek-r1
+model_reasoner = deepseek-r1
+model_chat = deepseel-v3
 
 [LLM_EXTRA_CONFIG]
-hy_source = web
-hy_user = your_user_id_here
-agent_id = your_agent_id_here
+; hy_source = web
+; hy_user = your_user_id_here
+; agent_id = your_agent_id_here
 should_remove_conversation = true
 
 [NEO4J_CONFIG]

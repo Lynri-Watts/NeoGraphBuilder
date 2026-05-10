@@ -277,7 +277,7 @@ def create_gradio_interface():
                 result_output = gr.Textbox(
                     label="生成结果",
                     interactive=False,
-                    lines=20
+                    lines=40
                 )
                 
                 # 清空按钮
